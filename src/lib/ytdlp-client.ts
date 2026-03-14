@@ -59,6 +59,26 @@ interface YtDlpVideoJson {
 export class YtDlpClient {
   constructor(private readonly binary = "yt-dlp") {}
 
+  getBinary(): string {
+    return this.binary;
+  }
+
+  async probe(): Promise<{ binary: string; version: string }> {
+    try {
+      const { stdout } = await execa(this.binary, ["--version"], {
+        timeout: 30_000,
+        reject: true,
+      });
+      return {
+        binary: this.binary,
+        version: stdout.trim(),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`yt-dlp probe failed: ${message}`);
+    }
+  }
+
   private async runJson(args: string[]): Promise<YtDlpVideoJson> {
     try {
       const { stdout } = await execa(this.binary, args, {

@@ -1,0 +1,745 @@
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { startStdioServer } from "../server/mcp-server.js";
+import {
+  detectKnownClients,
+  keyTransparencySummary,
+  readPackageMetadata,
+  resolveDefaultDataDir,
+  resolveChatGptDesktopSupportPaths,
+  type ClientDetectionSummary,
+  type KnownClientId,
+} from "./install-diagnostics.js";
+import { YouTubeService } from "./youtube-service.js";
+
+type JsonObject = Record<string, unknown>;
+
+export interface McpServerEntry {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+}
+
+export interface McpConfigInspection {
+  path?: string;
+  status: "not_found" | "registered" | "missing" | "invalid_json";
+  error?: string;
+  serverEntry?: JsonObject;
+  envKeys: string[];
+}
+
+export interface UpsertConfigResult {
+  path: string;
+  changed: boolean;
+  created: boolean;
+  backupPath?: string;
+  configText: string;
+}
+
+export interface ParsedCliArgs {
+  command: "serve" | "version" | "doctor" | "setup" | "help";
+  clientIds: KnownClientId[];
+  noLive: boolean;
+  printOnly: boolean;
+  dataDir?: string;
+  youtubeApiKey?: string;
+  geminiApiKey?: string;
+  googleApiKey?: string;
+}
+
+export interface CliDeps {
+  startServer: () => Promise<void>;
+  createService: () => YouTubeService;
+  packageMeta: ReturnType<typeof readPackageMetadata>;
+  detectClients: () => ClientDetectionSummary[];
+  writeStdout: (text: string) => void;
+  writeStderr: (text: string) => void;
+  env: NodeJS.ProcessEnv;
+  platform: NodeJS.Platform;
+  homeDir: string;
+  nodePath: string;
+  cliPath: string;
+  now: () => Date;
+}
+
+class CliUserError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CliUserError";
+  }
+}
+
+export async function runCli(args: string[], deps: Partial<CliDeps> = {}): Promise<number> {
+  const resolvedDeps = createCliDeps(deps);
+  const parsed = parseCliArgs(args);
+
+  switch (parsed.command) {
+    case "serve":
+      await resolvedDeps.startServer();
+      return 0;
+    case "version":
+      resolvedDeps.writeStdout(`${resolvedDeps.packageMeta.name} v${resolvedDeps.packageMeta.version}\n`);
+      return 0;
+    case "doctor":
+      resolvedDeps.writeStdout(await renderDoctorReport(parsed, resolvedDeps));
+      return 0;
+    case "setup":
+      resolvedDeps.writeStdout(renderSetupReport(parsed, resolvedDeps));
+      return 0;
+    case "help":
+      resolvedDeps.writeStdout(renderHelp(resolvedDeps.packageMeta.name));
+      return 0;
+    default:
+      return 0;
+  }
+}
+
+export function parseCliArgs(argv: string[]): ParsedCliArgs {
+  const args = [...argv];
+  const first = args[0];
+  let command: ParsedCliArgs["command"] = "serve";
+
+  if (first && !first.startsWith("-")) {
+    if (["serve", "version", "doctor", "setup", "help"].includes(first)) {
+      command = first as ParsedCliArgs["command"];
+      args.shift();
+    } else {
+      throw new CliUserError(`Unknown command: ${first}`);
+    }
+  }
+
+  const parsed: ParsedCliArgs = {
+    command,
+    clientIds: [],
+    noLive: false,
+    printOnly: false,
+  };
+
+  while (args.length > 0) {
+    const token = args.shift();
+    if (!token) {
+      continue;
+    }
+
+    if (token === "-h" || token === "--help") {
+      parsed.command = "help";
+      continue;
+    }
+
+    if (token === "--no-live") {
+      parsed.noLive = true;
+      continue;
+    }
+
+    if (token === "--print-only" || token === "--dry-run") {
+      parsed.printOnly = true;
+      continue;
+    }
+
+    if (token.startsWith("--client=")) {
+      parsed.clientIds.push(parseClientId(token.slice("--client=".length)));
+      continue;
+    }
+
+    if (token === "--client") {
+      parsed.clientIds.push(parseClientId(requireValue(args.shift(), "--client")));
+      continue;
+    }
+
+    if (token.startsWith("--data-dir=")) {
+      parsed.dataDir = token.slice("--data-dir=".length);
+      continue;
+    }
+
+    if (token === "--data-dir") {
+      parsed.dataDir = requireValue(args.shift(), "--data-dir");
+      continue;
+    }
+
+    if (token.startsWith("--youtube-api-key=")) {
+      parsed.youtubeApiKey = token.slice("--youtube-api-key=".length);
+      continue;
+    }
+
+    if (token === "--youtube-api-key") {
+      parsed.youtubeApiKey = requireValue(args.shift(), "--youtube-api-key");
+      continue;
+    }
+
+    if (token.startsWith("--gemini-api-key=")) {
+      parsed.geminiApiKey = token.slice("--gemini-api-key=".length);
+      continue;
+    }
+
+    if (token === "--gemini-api-key") {
+      parsed.geminiApiKey = requireValue(args.shift(), "--gemini-api-key");
+      continue;
+    }
+
+    if (token.startsWith("--google-api-key=")) {
+      parsed.googleApiKey = token.slice("--google-api-key=".length);
+      continue;
+    }
+
+    if (token === "--google-api-key") {
+      parsed.googleApiKey = requireValue(args.shift(), "--google-api-key");
+      continue;
+    }
+
+    throw new CliUserError(`Unknown flag: ${token}`);
+  }
+
+  return parsed;
+}
+
+export function buildServerEntry(options: {
+  nodePath: string;
+  cliPath: string;
+  dataDir: string;
+  youtubeApiKey?: string;
+  geminiApiKey?: string;
+  googleApiKey?: string;
+  existingEntry?: JsonObject;
+}): McpServerEntry {
+  const existingEnv = isRecord(options.existingEntry?.env)
+    ? stringifyEnv(options.existingEntry.env)
+    : {};
+  const env: Record<string, string> = {
+    ...existingEnv,
+    YOUTUBE_MCP_DATA_DIR: options.dataDir,
+  };
+
+  if (options.youtubeApiKey) {
+    env.YOUTUBE_API_KEY = options.youtubeApiKey;
+  }
+  if (options.geminiApiKey) {
+    env.GEMINI_API_KEY = options.geminiApiKey;
+  }
+  if (options.googleApiKey) {
+    env.GOOGLE_API_KEY = options.googleApiKey;
+  }
+
+  return {
+    command: options.nodePath,
+    args: [options.cliPath, "serve"],
+    env,
+  };
+}
+
+export function inspectMcpConfigText(configText: string, serverName = "youtube-mcp"): McpConfigInspection {
+  try {
+    const parsed = JSON.parse(configText) as unknown;
+    if (!isRecord(parsed)) {
+      return {
+        status: "invalid_json",
+        error: "Config root must be a JSON object.",
+        envKeys: [],
+      };
+    }
+
+    const mcpServers = isRecord(parsed.mcpServers) ? parsed.mcpServers : undefined;
+    const serverEntry = mcpServers && isRecord(mcpServers[serverName]) ? (mcpServers[serverName] as JsonObject) : undefined;
+
+    return {
+      status: serverEntry ? "registered" : "missing",
+      serverEntry,
+      envKeys: serverEntry && isRecord(serverEntry.env) ? Object.keys(serverEntry.env) : [],
+    };
+  } catch (error) {
+    return {
+      status: "invalid_json",
+      error: toMessage(error),
+      envKeys: [],
+    };
+  }
+}
+
+export function inspectMcpConfigPath(configPath: string | undefined, serverName = "youtube-mcp"): McpConfigInspection {
+  if (!configPath || !existsSync(configPath)) {
+    return {
+      path: configPath,
+      status: "not_found",
+      envKeys: [],
+    };
+  }
+
+  const result = inspectMcpConfigText(readFileSync(configPath, "utf8"), serverName);
+  result.path = configPath;
+  return result;
+}
+
+export function mergeMcpConfigText(
+  existingText: string | undefined,
+  serverName: string,
+  serverEntry: McpServerEntry,
+): string {
+  const root = parseConfigRoot(existingText);
+  const mcpServers = isRecord(root.mcpServers) ? { ...root.mcpServers } : {};
+  const existingEntry = isRecord(mcpServers[serverName]) ? (mcpServers[serverName] as JsonObject) : undefined;
+  const merged = buildServerEntry({
+    nodePath: serverEntry.command,
+    cliPath: serverEntry.args[0] ?? "dist/cli.js",
+    dataDir: serverEntry.env?.YOUTUBE_MCP_DATA_DIR ?? "",
+    youtubeApiKey: serverEntry.env?.YOUTUBE_API_KEY,
+    geminiApiKey: serverEntry.env?.GEMINI_API_KEY,
+    googleApiKey: serverEntry.env?.GOOGLE_API_KEY,
+    existingEntry,
+  });
+
+  const nextRoot: JsonObject = {
+    ...root,
+    mcpServers: {
+      ...mcpServers,
+      [serverName]: merged,
+    },
+  };
+
+  return `${JSON.stringify(nextRoot, null, 2)}\n`;
+}
+
+export function upsertMcpServerConfig(options: {
+  configPath: string;
+  serverName?: string;
+  entry: McpServerEntry;
+  printOnly?: boolean;
+  now?: Date;
+}): UpsertConfigResult {
+  const serverName = options.serverName ?? "youtube-mcp";
+  const existingText = existsSync(options.configPath) ? readFileSync(options.configPath, "utf8") : undefined;
+  const nextText = mergeMcpConfigText(existingText, serverName, options.entry);
+  const changed = existingText !== nextText;
+  const created = !existingText;
+
+  let backupPath: string | undefined;
+  if (!options.printOnly && changed) {
+    mkdirSync(dirname(options.configPath), { recursive: true });
+    if (existingText !== undefined) {
+      const timestamp = (options.now ?? new Date()).toISOString().replace(/[:.]/g, "-");
+      backupPath = `${options.configPath}.bak.${timestamp}`;
+      copyFileSync(options.configPath, backupPath);
+    }
+    writeFileSync(options.configPath, nextText, "utf8");
+  }
+
+  return {
+    path: options.configPath,
+    changed,
+    created,
+    backupPath,
+    configText: nextText,
+  };
+}
+
+function createCliDeps(overrides: Partial<CliDeps>): CliDeps {
+  return {
+    startServer: overrides.startServer ?? (() => startStdioServer()),
+    createService: overrides.createService ?? (() => new YouTubeService()),
+    packageMeta: overrides.packageMeta ?? readPackageMetadata(),
+    detectClients: overrides.detectClients ?? (() => detectKnownClients()),
+    writeStdout: overrides.writeStdout ?? ((text) => process.stdout.write(text)),
+    writeStderr: overrides.writeStderr ?? ((text) => process.stderr.write(text)),
+    env: overrides.env ?? process.env,
+    platform: overrides.platform ?? process.platform,
+    homeDir: overrides.homeDir ?? homedir(),
+    nodePath: overrides.nodePath ?? process.execPath,
+    cliPath: overrides.cliPath ?? fileURLToPath(new URL("../cli.js", import.meta.url)),
+    now: overrides.now ?? (() => new Date()),
+  };
+}
+
+async function renderDoctorReport(parsed: ParsedCliArgs, deps: CliDeps): Promise<string> {
+  const service = deps.createService();
+  const health = await service.checkSystemHealth({ runLiveChecks: !parsed.noLive });
+  const clients = deps.detectClients();
+  const claudeDesktop = clients.find((client) => client.clientId === "claude_desktop");
+  const claudeInspection = inspectMcpConfigPath(claudeDesktop?.configPath);
+  const shellKeyState = buildShellKeyState(deps.env);
+  const configKeyState = buildConfigKeyState(claudeInspection.envKeys);
+  const suggestions = dedupeStrings([
+    ...health.suggestions,
+    ...doctorSetupSuggestions(claudeDesktop, claudeInspection),
+  ]);
+
+  const lines: string[] = [];
+  lines.push(`${deps.packageMeta.name} doctor (v${deps.packageMeta.version})`);
+  lines.push("");
+  lines.push(`Overall: ${health.overallStatus.toUpperCase()}`);
+  lines.push(`CLI path: ${deps.cliPath}`);
+  lines.push(`Node: ${health.runtime.nodeVersion}`);
+  lines.push(`Data dir: ${health.dataDir}`);
+  lines.push("");
+  lines.push("Checks:");
+  for (const check of health.checks) {
+    lines.push(`- ${statusPrefix(check.status)} ${check.name}: ${check.detail}`);
+  }
+  lines.push("");
+  lines.push("Client registration:");
+  lines.push(`- Claude Desktop detected: ${yesNo(Boolean(claudeDesktop?.detected))}`);
+  lines.push(`- Claude Desktop config path: ${claudeDesktop?.configPath ?? "unknown"}`);
+  lines.push(`- youtube-mcp in Claude Desktop config: ${describeInspectionStatus(claudeInspection)}`);
+  if (claudeInspection.status === "registered") {
+    const command = typeof claudeInspection.serverEntry?.command === "string"
+      ? claudeInspection.serverEntry.command
+      : "unknown";
+    const args = Array.isArray(claudeInspection.serverEntry?.args)
+      ? (claudeInspection.serverEntry.args as unknown[]).map(String).join(" ")
+      : "";
+    lines.push(`- Claude Desktop command: ${command}${args ? ` ${args}` : ""}`);
+  }
+  const chatgptDesktop = clients.find((client) => client.clientId === "chatgpt_desktop");
+  if (chatgptDesktop) {
+    lines.push(`- ChatGPT Desktop detected: ${yesNo(chatgptDesktop.detected)}`);
+    lines.push(`- ChatGPT Desktop support: manual copy path only tonight`);
+  }
+  lines.push("");
+  lines.push("Key presence:");
+  lines.push(`- Shell YOUTUBE_API_KEY: ${shellKeyState.youtube}`);
+  lines.push(`- Claude Desktop YOUTUBE_API_KEY: ${configKeyState.youtube}`);
+  lines.push(`- Shell GEMINI_API_KEY / GOOGLE_API_KEY: ${shellKeyState.gemini}`);
+  lines.push(`- Claude Desktop GEMINI_API_KEY / GOOGLE_API_KEY: ${configKeyState.gemini}`);
+  lines.push("");
+  lines.push("Key transparency:");
+  for (const item of keyTransparencySummary()) {
+    lines.push(`- ${item.key}`);
+    lines.push(`  unlocks: ${item.unlocks}`);
+    lines.push(`  works without it: ${item.notRequiredFor}`);
+  }
+  lines.push("");
+  if (suggestions.length > 0) {
+    lines.push("Suggested next steps:");
+    for (const suggestion of suggestions) {
+      lines.push(`- ${suggestion}`);
+    }
+    lines.push("");
+  }
+  lines.push("Helpful commands:");
+  lines.push(`- node ${deps.cliPath} doctor --no-live`);
+  lines.push(`- node ${deps.cliPath} setup`);
+  lines.push(`- node ${deps.cliPath} version`);
+
+  return `${lines.join("\n")}\n`;
+}
+
+function renderSetupReport(parsed: ParsedCliArgs, deps: CliDeps): string {
+  const clients = deps.detectClients();
+  const targetClients = parsed.clientIds.length > 0 ? dedupeClientIds(parsed.clientIds) : ["claude_desktop"];
+  const dataDir = parsed.dataDir ?? deps.env.YOUTUBE_MCP_DATA_DIR ?? resolveDefaultDataDir(deps.homeDir, deps.platform);
+  const lines: string[] = [];
+  const errors: string[] = [];
+
+  lines.push(`${deps.packageMeta.name} setup (v${deps.packageMeta.version})`);
+  lines.push("");
+  lines.push(`CLI path: ${deps.cliPath}`);
+  lines.push(`Node path: ${deps.nodePath}`);
+  lines.push(`Data dir: ${dataDir}`);
+  lines.push(`Mode: ${parsed.printOnly ? "print-only" : "write config"}`);
+  lines.push("");
+  lines.push("Key transparency:");
+  for (const item of keyTransparencySummary()) {
+    lines.push(`- ${item.key}`);
+    lines.push(`  unlocks: ${item.unlocks}`);
+    lines.push(`  works without it: ${item.notRequiredFor}`);
+  }
+  lines.push("");
+
+  const claudeDesktop = clients.find((client) => client.clientId === "claude_desktop");
+  const shouldHandleClaudeDesktop = targetClients.includes("claude_desktop");
+  if (shouldHandleClaudeDesktop) {
+    lines.push("Claude Desktop:");
+    if (!claudeDesktop?.configPath) {
+      errors.push("Claude Desktop config path could not be resolved.");
+      lines.push("- Could not resolve a config path for Claude Desktop on this machine.");
+    } else {
+      const inspection = inspectMcpConfigPath(claudeDesktop.configPath);
+      if (inspection.status === "invalid_json") {
+        errors.push(`Claude Desktop config is invalid JSON (${claudeDesktop.configPath}).`);
+        lines.push(`- Refused to overwrite invalid JSON: ${claudeDesktop.configPath}`);
+        lines.push(`- Error: ${inspection.error ?? "Unknown JSON parse error."}`);
+      } else {
+        const entry = buildServerEntry({
+          nodePath: deps.nodePath,
+          cliPath: deps.cliPath,
+          dataDir,
+          youtubeApiKey: parsed.youtubeApiKey ?? deps.env.YOUTUBE_API_KEY,
+          geminiApiKey: parsed.geminiApiKey ?? deps.env.GEMINI_API_KEY,
+          googleApiKey: parsed.googleApiKey ?? deps.env.GOOGLE_API_KEY,
+          existingEntry: inspection.serverEntry,
+        });
+        const result = upsertMcpServerConfig({
+          configPath: claudeDesktop.configPath,
+          entry,
+          printOnly: parsed.printOnly,
+          now: deps.now(),
+        });
+        lines.push(`- Target config: ${result.path}`);
+        lines.push(`- Status: ${describeSetupResult(result, inspection.status === "registered")}`);
+        if (result.backupPath) {
+          lines.push(`- Backup: ${result.backupPath}`);
+        }
+        lines.push(`- Server name: youtube-mcp`);
+        lines.push("- Generated MCP entry:");
+        lines.push(indent(JSON.stringify(redactEntryForDisplay(entry), null, 2), "  "));
+        if (!parsed.printOnly) {
+          lines.push("- Next: fully quit and reopen Claude Desktop.");
+        }
+      }
+    }
+    lines.push("");
+  }
+
+  const shouldDescribeChatGpt = targetClients.includes("chatgpt_desktop")
+    || (parsed.clientIds.length === 0 && clients.some((client) => client.clientId === "chatgpt_desktop" && client.detected));
+  if (shouldDescribeChatGpt) {
+    const chatgptClient = clients.find((client) => client.clientId === "chatgpt_desktop");
+    const entry = buildServerEntry({
+      nodePath: deps.nodePath,
+      cliPath: deps.cliPath,
+      dataDir,
+      youtubeApiKey: parsed.youtubeApiKey ?? deps.env.YOUTUBE_API_KEY,
+      geminiApiKey: parsed.geminiApiKey ?? deps.env.GEMINI_API_KEY,
+      googleApiKey: parsed.googleApiKey ?? deps.env.GOOGLE_API_KEY,
+    });
+    lines.push("ChatGPT Desktop / Ultra:");
+    lines.push(`- Detected: ${yesNo(Boolean(chatgptClient?.detected))}`);
+    lines.push("- Automation status: manual copy only tonight. The app's MCP storage path/schema is still shifting, so setup will not mutate it blindly.");
+    const supportPaths = resolveChatGptDesktopSupportPaths(deps.homeDir, deps.platform, deps.env);
+    lines.push(`- Support path candidates: ${supportPaths.join(", ")}`);
+    lines.push("- Use this generated server entry in the ChatGPT Desktop MCP UI/JSON if available:");
+    lines.push(indent(JSON.stringify({ name: "youtube-mcp", ...redactEntryForDisplay(entry) }, null, 2), "  "));
+    lines.push("");
+  }
+
+  if (targetClients.some((clientId) => clientId === "claude_code" || clientId === "cursor" || clientId === "vscode" || clientId === "codex")) {
+    lines.push("Other clients:");
+    lines.push("- Claude Code / Cursor / VS Code / Codex are detection targets tonight, but this setup pass does not auto-write their config surfaces.");
+    lines.push("- Focus tonight is a clean macOS desktop path: Claude Desktop automation plus a truthful ChatGPT manual block.");
+    lines.push("");
+  }
+
+  if (errors.length > 0) {
+    lines.push("Setup blockers:");
+    for (const error of errors) {
+      lines.push(`- ${error}`);
+    }
+    lines.push("");
+    lines.push("Fallback:");
+    lines.push("- Run with --print-only to generate the exact MCP entry without touching config files.");
+    lines.push("- Fix the broken JSON file, then rerun setup.");
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function renderHelp(packageName: string): string {
+  return `${packageName} CLI
+
+Usage:
+  youtube-mcp                 Start the MCP server over stdio
+  youtube-mcp serve           Start the MCP server over stdio
+  youtube-mcp version         Print package version
+  youtube-mcp doctor          Run setup/health diagnostics
+  youtube-mcp setup           Configure Claude Desktop and print ChatGPT manual entry
+
+Common flags:
+  --client <id>              Target client (claude_desktop, chatgpt_desktop, claude_code, cursor, vscode, codex)
+  --data-dir <path>          Override YOUTUBE_MCP_DATA_DIR for generated config
+  --youtube-api-key <key>    Persist YOUTUBE_API_KEY into generated client config
+  --gemini-api-key <key>     Persist GEMINI_API_KEY into generated client config
+  --google-api-key <key>     Persist GOOGLE_API_KEY into generated client config
+  --no-live                  Doctor: skip live network validation probes
+  --print-only               Setup: print generated config without writing files
+  -h, --help                 Show this help
+`;
+}
+
+function buildShellKeyState(env: NodeJS.ProcessEnv): { youtube: string; gemini: string } {
+  return {
+    youtube: env.YOUTUBE_API_KEY ? "set in current shell" : "not set in current shell",
+    gemini: env.GEMINI_API_KEY || env.GOOGLE_API_KEY
+      ? "set in current shell"
+      : "not set in current shell",
+  };
+}
+
+function buildConfigKeyState(envKeys: string[]): { youtube: string; gemini: string } {
+  return {
+    youtube: envKeys.includes("YOUTUBE_API_KEY") ? "present in Claude Desktop config" : "not present in Claude Desktop config",
+    gemini: envKeys.includes("GEMINI_API_KEY") || envKeys.includes("GOOGLE_API_KEY")
+      ? "present in Claude Desktop config"
+      : "not present in Claude Desktop config",
+  };
+}
+
+function doctorSetupSuggestions(
+  claudeDesktop: ClientDetectionSummary | undefined,
+  inspection: McpConfigInspection,
+): string[] {
+  const suggestions: string[] = [];
+  if (claudeDesktop?.configPath && inspection.status === "not_found") {
+    suggestions.push(`Run setup to create ${claudeDesktop.configPath} and register youtube-mcp for Claude Desktop.`);
+  }
+  if (inspection.status === "missing") {
+    suggestions.push("Run setup to add youtube-mcp to Claude Desktop without disturbing other MCP servers.");
+  }
+  if (inspection.status === "invalid_json") {
+    suggestions.push(`Fix the invalid Claude Desktop config JSON at ${claudeDesktop?.configPath ?? "the detected config path"}, then rerun setup.`);
+  }
+  if (inspection.status === "registered") {
+    suggestions.push("Restart Claude Desktop after any setup changes so the updated MCP server registration is reloaded.");
+  }
+  return suggestions;
+}
+
+function describeSetupResult(result: UpsertConfigResult, alreadyRegistered: boolean): string {
+  if (result.changed && result.created) {
+    return result.path.endsWith(".json") ? "created config and registered youtube-mcp" : "created target and registered youtube-mcp";
+  }
+  if (result.changed && alreadyRegistered) {
+    return "updated existing youtube-mcp entry in-place";
+  }
+  if (result.changed) {
+    return "merged youtube-mcp into existing MCP config";
+  }
+  return "already configured; no file changes were needed";
+}
+
+function describeInspectionStatus(inspection: McpConfigInspection): string {
+  switch (inspection.status) {
+    case "registered":
+      return "registered";
+    case "missing":
+      return "config exists, but youtube-mcp is not registered";
+    case "invalid_json":
+      return `invalid JSON (${inspection.error ?? "unknown parse error"})`;
+    case "not_found":
+      return "config file not found";
+    default:
+      return inspection.status;
+  }
+}
+
+function parseClientId(raw: string): KnownClientId {
+  const normalized = raw.trim().toLowerCase();
+  switch (normalized) {
+    case "claude":
+    case "claude_desktop":
+    case "claude-desktop":
+      return "claude_desktop";
+    case "chatgpt":
+    case "chatgpt_desktop":
+    case "chatgpt-desktop":
+    case "ultra":
+      return "chatgpt_desktop";
+    case "claude_code":
+    case "claude-code":
+      return "claude_code";
+    case "cursor":
+      return "cursor";
+    case "vscode":
+    case "vs-code":
+    case "code":
+      return "vscode";
+    case "codex":
+      return "codex";
+    default:
+      throw new CliUserError(`Unknown client id: ${raw}`);
+  }
+}
+
+function parseConfigRoot(existingText: string | undefined): JsonObject {
+  if (!existingText?.trim()) {
+    return {};
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(existingText);
+  } catch (error) {
+    throw new CliUserError(`Config file is not valid JSON: ${toMessage(error)}`);
+  }
+
+  if (!isRecord(parsed)) {
+    throw new CliUserError("Config file must contain a JSON object at the root.");
+  }
+
+  return { ...parsed };
+}
+
+function stringifyEnv(env: JsonObject): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string") {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function redactEntryForDisplay(entry: McpServerEntry): McpServerEntry {
+  const redactedEnv = entry.env
+    ? Object.fromEntries(
+        Object.entries(entry.env).map(([key, value]) => {
+          if (["YOUTUBE_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"].includes(key) && value) {
+            return [key, "<set>"];
+          }
+          return [key, value];
+        }),
+      )
+    : undefined;
+
+  return {
+    ...entry,
+    env: redactedEnv,
+  };
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function dedupeClientIds(values: KnownClientId[]): KnownClientId[] {
+  return [...new Set(values)];
+}
+
+function statusPrefix(status: string): string {
+  switch (status) {
+    case "ok":
+      return "[ok]";
+    case "warn":
+      return "[warn]";
+    case "error":
+      return "[error]";
+    case "skipped":
+      return "[skip]";
+    default:
+      return `[${status}]`;
+  }
+}
+
+function requireValue(value: string | undefined, flagName: string): string {
+  if (!value) {
+    throw new CliUserError(`${flagName} requires a value`);
+  }
+  return value;
+}
+
+function yesNo(value: boolean): string {
+  return value ? "yes" : "no";
+}
+
+function indent(text: string, prefix: string): string {
+  return text
+    .split("\n")
+    .map((line) => `${prefix}${line}`)
+    .join("\n");
+}
+
+function isRecord(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

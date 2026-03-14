@@ -445,6 +445,401 @@ export interface AnalyzePlaylistOutput {
   provenance: Provenance;
 }
 
+export interface PlaylistKnowledgeBaseInput extends TokenControls {
+  playlistUrlOrId: string;
+  collectionId?: string;
+  maxVideos?: number;
+  chunkStrategy?: "time_window" | "chapters" | "auto";
+  chunkSizeSec?: number;
+  chunkOverlapSec?: number;
+  language?: string;
+  reindexExisting?: boolean;
+  label?: string;
+  embeddingProvider?: "local" | "gemini";
+  embeddingModel?: string;
+  embeddingDimensions?: number;
+  activateCollection?: boolean;
+}
+
+export interface VideoKnowledgeBaseInput extends TokenControls {
+  videoIdsOrUrls: string[];
+  chunkStrategy?: "time_window" | "chapters" | "auto";
+  chunkSizeSec?: number;
+  chunkOverlapSec?: number;
+  language?: string;
+  collectionId?: string;
+  reindexExisting?: boolean;
+  label?: string;
+  embeddingProvider?: "local" | "gemini";
+  embeddingModel?: string;
+  embeddingDimensions?: number;
+  activateCollection?: boolean;
+}
+
+export interface CollectionScopeMeta {
+  mode: "explicit" | "active" | "all_collections";
+  activeCollectionId?: string;
+  searchedCollectionIds: string[];
+}
+
+export interface ImportPlaylistOutput {
+  playlist: {
+    playlistId: string;
+    title?: string;
+    channelTitle?: string;
+    videoCountReported?: number;
+  };
+  import: {
+    totalVideos: number;
+    imported: number;
+    skipped: number;
+    failed: number;
+    chunksCreated: number;
+    embeddingsGenerated: number;
+  };
+  failures?: Array<{
+    videoId: string;
+    reason: string;
+  }>;
+  collectionId: string;
+  activeCollectionId?: string;
+  provenance: Provenance;
+}
+
+export interface ImportVideosOutput {
+  import: {
+    totalVideos: number;
+    imported: number;
+    skipped: number;
+    failed: number;
+    chunksCreated: number;
+    embeddingsGenerated: number;
+  };
+  failures?: Array<{
+    videoId: string;
+    reason: string;
+  }>;
+  collectionId: string;
+  activeCollectionId?: string;
+  provenance: Provenance;
+}
+
+export interface SearchTranscriptsInput extends TokenControls {
+  query: string;
+  collectionId?: string;
+  maxResults?: number;
+  minScore?: number;
+  videoIdFilter?: string[];
+  useActiveCollection?: boolean;
+}
+
+export interface SearchTranscriptsOutput {
+  query: string;
+  results: Array<{
+    collectionId: string;
+    videoId: string;
+    videoTitle: string;
+    channelTitle?: string;
+    chunkText: string;
+    tStartSec: number;
+    tEndSec?: number;
+    timestampUrl: string;
+    score: number;
+    lexicalScore?: number;
+    semanticScore?: number;
+    context?: {
+      prevChunkText?: string;
+      nextChunkText?: string;
+    };
+  }>;
+  searchMeta: {
+    totalChunksSearched: number;
+    embeddingModel: string;
+    searchLatencyMs: number;
+    scope: CollectionScopeMeta;
+  };
+  provenance: Provenance;
+}
+
+export interface CollectionSummary {
+  collectionId: string;
+  label?: string;
+  sourceType: "playlist" | "videos";
+  sourcePlaylistId?: string;
+  sourceTitle?: string;
+  sourceChannelTitle?: string;
+  videoCount: number;
+  totalChunks: number;
+  createdAt: string;
+  lastUpdatedAt: string;
+  embeddingProvider?: "local" | "gemini";
+  embeddingModel?: string;
+  embeddingDimensions?: number;
+  isActive?: boolean;
+  videos?: Array<{
+    videoId: string;
+    title?: string;
+    channelTitle?: string;
+    publishedAt?: string;
+  }>;
+}
+
+export interface ListCollectionsInput extends TokenControls {
+  includeVideoList?: boolean;
+}
+
+export interface ListCollectionsOutput {
+  collections: CollectionSummary[];
+  activeCollectionId?: string;
+  provenance: Provenance;
+}
+
+export interface SetActiveCollectionInput {
+  collectionId: string;
+}
+
+export interface SetActiveCollectionOutput {
+  activeCollectionId: string;
+  collection?: CollectionSummary;
+  provenance: Provenance;
+}
+
+export interface ClearActiveCollectionOutput {
+  cleared: boolean;
+  previousActiveCollectionId?: string;
+  provenance: Provenance;
+}
+
+export interface DiagnosticCheck {
+  name: string;
+  status: "ok" | "warn" | "error" | "skipped";
+  detail: string;
+}
+
+export interface ClientDetectionSummary {
+  clientId: "claude_desktop" | "claude_code" | "cursor" | "vscode" | "chatgpt_desktop" | "codex";
+  name: string;
+  detected: boolean;
+  supportLevel: "supported" | "scaffolded" | "future";
+  installSurface: "config_file" | "binary" | "app_bundle" | "mixed" | "unknown";
+  configPath?: string;
+  binary?: string;
+  notes?: string[];
+}
+
+export interface CheckImportReadinessInput extends TokenControls {
+  videoIdOrUrl: string;
+  language?: string;
+}
+
+export interface CheckImportReadinessOutput {
+  videoId: string;
+  title?: string;
+  importReadiness: {
+    canImport: boolean;
+    status: "ready" | "ready_sparse_transcript" | "blocked" | "uncertain";
+    summary: string;
+    suggestedCollectionId: string;
+  };
+  transcript: {
+    available: boolean;
+    sourceType?: "manual_caption" | "auto_caption" | "generated_from_audio" | "unknown";
+    languageUsed?: string;
+    segmentCount?: number;
+    transcriptCharacters?: number;
+    sparseTranscript?: boolean;
+    estimatedSearchableChunks?: number;
+  };
+  checks: DiagnosticCheck[];
+  suggestions: string[];
+  provenance: Provenance;
+}
+
+export interface BuildVideoDossierInput extends TokenControls {
+  videoIdOrUrl: string;
+  commentSampleSize?: number;
+  includeComments?: boolean;
+  includeSentiment?: boolean;
+  includeTranscriptSummary?: boolean;
+}
+
+export interface BuildVideoDossierOutput {
+  video: InspectVideoOutput["video"];
+  stats: InspectVideoOutput["stats"];
+  transcript: {
+    available: boolean;
+    importReadiness: CheckImportReadinessOutput["importReadiness"];
+    languageUsed?: string;
+    sourceType?: "manual_caption" | "auto_caption" | "generated_from_audio" | "unknown";
+    summary?: string;
+    sparseTranscript?: boolean;
+  };
+  comments?: {
+    totalFetched: number;
+    sample: Array<{
+      author: string;
+      text: string;
+      likeCount?: number;
+      publishedAt?: string;
+    }>;
+  };
+  audienceSentiment?: MeasureAudienceSentimentOutput["sentiment"];
+  riskSignals?: MeasureAudienceSentimentOutput["riskSignals"];
+  representativeQuotes?: MeasureAudienceSentimentOutput["representativeQuotes"];
+  suggestedCollectionId: string;
+  checks: DiagnosticCheck[];
+  provenance: Provenance;
+}
+
+export interface CheckSystemHealthInput extends TokenControls {
+  runLiveChecks?: boolean;
+}
+
+export interface CheckSystemHealthOutput {
+  overallStatus: "ready" | "degraded" | "setup_needed";
+  dataDir: string;
+  runtime: {
+    nodeVersion: string;
+    packageName: string;
+    packageVersion: string;
+  };
+  keys: {
+    youtubeApiConfigured: boolean;
+    geminiConfigured: boolean;
+  };
+  clients: ClientDetectionSummary[];
+  checks: DiagnosticCheck[];
+  suggestions: string[];
+  provenance: Provenance;
+}
+
+// ── Comment Knowledge Base Types ──
+
+export interface ImportCommentsInput extends TokenControls {
+  videoIdOrUrl: string;
+  collectionId?: string;
+  maxTopLevel?: number;
+  includeReplies?: boolean;
+  maxRepliesPerThread?: number;
+  order?: "relevance" | "time";
+  label?: string;
+  activateCollection?: boolean;
+}
+
+export interface ImportCommentsOutput {
+  videoId: string;
+  collectionId: string;
+  import: {
+    totalThreads: number;
+    totalComments: number;
+    chunksCreated: number;
+  };
+  activeCollectionId?: string;
+  provenance: Provenance;
+}
+
+export interface SearchCommentsInput extends TokenControls {
+  query: string;
+  collectionId?: string;
+  maxResults?: number;
+  minScore?: number;
+  videoIdFilter?: string[];
+  useActiveCollection?: boolean;
+}
+
+export interface SearchCommentsOutput {
+  query: string;
+  results: Array<{
+    collectionId: string;
+    videoId: string;
+    videoTitle: string;
+    author: string;
+    commentText: string;
+    likeCount?: number;
+    publishedAt?: string;
+    isReply: boolean;
+    parentAuthor?: string;
+    score: number;
+    lexicalScore?: number;
+    semanticScore?: number;
+  }>;
+  searchMeta: {
+    totalChunksSearched: number;
+    embeddingModel: string;
+    searchLatencyMs: number;
+    scope: CollectionScopeMeta;
+  };
+  provenance: Provenance;
+}
+
+export interface ListCommentCollectionsInput extends TokenControls {
+  includeVideoList?: boolean;
+}
+
+export interface CommentCollectionSummary {
+  collectionId: string;
+  label?: string;
+  videoCount: number;
+  totalCommentChunks: number;
+  createdAt: string;
+  lastUpdatedAt: string;
+  isActive?: boolean;
+  videos?: Array<{
+    videoId: string;
+    title?: string;
+    threadCount?: number;
+    commentCount?: number;
+  }>;
+}
+
+export interface ListCommentCollectionsOutput {
+  collections: CommentCollectionSummary[];
+  activeCollectionId?: string;
+  provenance: Provenance;
+}
+
+export interface RemoveCommentCollectionInput {
+  collectionId: string;
+}
+
+export interface RemoveCommentCollectionOutput {
+  removed: boolean;
+  collectionId: string;
+  chunksDeleted: number;
+  videosDeleted: number;
+  clearedActiveCollection?: boolean;
+  provenance: Provenance;
+}
+
+export interface SetActiveCommentCollectionInput {
+  collectionId: string;
+}
+
+export interface SetActiveCommentCollectionOutput {
+  activeCollectionId: string;
+  collection?: CommentCollectionSummary;
+  provenance: Provenance;
+}
+
+export interface ClearActiveCommentCollectionOutput {
+  cleared: boolean;
+  previousActiveCollectionId?: string;
+  provenance: Provenance;
+}
+
+export interface RemoveCollectionInput {
+  collectionId: string;
+}
+
+export interface RemoveCollectionOutput {
+  removed: boolean;
+  collectionId: string;
+  chunksDeleted: number;
+  videosDeleted: number;
+  clearedActiveCollection?: boolean;
+  provenance: Provenance;
+}
+
 export interface ScoreHookPatternsInput extends TokenControls {
   videoIdsOrUrls: string[];
   hookWindowSec?: number;
@@ -537,5 +932,214 @@ export interface RecommendUploadWindowsOutput {
     bestHour?: number;
     consistencyScore?: number;
   };
+  provenance: Provenance;
+}
+
+// ─── Trends & Discovery ────────────────────────────────────────────
+
+export interface DiscoverNicheTrendsInput extends TokenControls {
+  niche: string;
+  regionCode?: string;
+  maxResults?: number;
+  lookbackDays?: number;
+}
+
+export interface TrendingVideo {
+  videoId: string;
+  title: string;
+  channelTitle: string;
+  publishedAt?: string;
+  durationSec?: number;
+  views?: number;
+  likes?: number;
+  comments?: number;
+  engagementRate?: number;
+  viewVelocity24h?: number;
+  format: "short" | "long" | "unknown";
+  tags?: string[];
+}
+
+export interface NicheMomentum {
+  medianViews?: number;
+  medianEngagementRate?: number;
+  recentVsOlderViewRatio?: number;
+  recencyBias: "accelerating" | "steady" | "decelerating" | "insufficient_data";
+  explanation: string;
+}
+
+export interface ContentGap {
+  angle: string;
+  evidence: string;
+  opportunityScore: number;
+}
+
+export interface NicheSaturation {
+  totalResultsSampled: number;
+  medianViews?: number;
+  topQuartileViews?: number;
+  bottomQuartileViews?: number;
+  saturationLevel: "low" | "medium" | "high" | "insufficient_data";
+  explanation: string;
+}
+
+export interface DiscoverNicheTrendsOutput {
+  niche: string;
+  regionCode?: string;
+  trendingVideos: TrendingVideo[];
+  momentum: NicheMomentum;
+  saturation: NicheSaturation;
+  contentGaps: ContentGap[];
+  recurringKeywords: string[];
+  titlePatterns: string[];
+  formatBreakdown: {
+    shortsPct: number;
+    longFormPct: number;
+    unknownPct: number;
+  };
+  limitations: string[];
+  provenance: Provenance;
+}
+
+export interface ExploreNicheCompetitorsInput extends TokenControls {
+  niche: string;
+  regionCode?: string;
+  maxChannels?: number;
+}
+
+export interface NicheCompetitor {
+  channelId?: string;
+  channelTitle: string;
+  videosSampled: number;
+  medianViews?: number;
+  medianEngagementRate?: number;
+  estimatedUploadFrequency?: string;
+  topVideo?: {
+    videoId: string;
+    title: string;
+    views?: number;
+  };
+}
+
+export interface ExploreNicheCompetitorsOutput {
+  niche: string;
+  competitors: NicheCompetitor[];
+  landscape: {
+    totalChannelsSampled: number;
+    medianViewsAcrossChannels?: number;
+    topPerformerChannelTitle?: string;
+  };
+  limitations: string[];
+  provenance: Provenance;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Media / Asset types (V-next: local media storage)
+ * ──────────────────────────────────────────────────────────────── */
+
+export type MediaAssetKind = "video" | "audio" | "thumbnail" | "keyframe";
+
+export interface DownloadAssetInput {
+  videoIdOrUrl: string;
+  format: "best_video" | "best_audio" | "thumbnail" | "worst_video";
+  maxSizeMb?: number;
+}
+
+export interface DownloadAssetOutput {
+  asset: {
+    assetId: string;
+    videoId: string;
+    kind: MediaAssetKind;
+    filePath: string;
+    fileName: string;
+    fileSizeBytes: number;
+    mimeType: string;
+    durationSec?: number;
+    width?: number;
+    height?: number;
+  };
+  downloadedBytes: number;
+  durationMs: number;
+  cached: boolean;
+  provenance: Provenance;
+}
+
+export interface ListMediaAssetsInput {
+  videoIdOrUrl?: string;
+  kind?: MediaAssetKind;
+  limit?: number;
+}
+
+export interface ListMediaAssetsOutput {
+  assets: Array<{
+    assetId: string;
+    videoId: string;
+    kind: MediaAssetKind;
+    filePath: string;
+    fileName: string;
+    fileSizeBytes: number;
+    mimeType: string;
+    timestampSec?: number;
+    width?: number;
+    height?: number;
+    durationSec?: number;
+    createdAt: string;
+  }>;
+  stats: {
+    totalAssets: number;
+    totalSizeBytes: number;
+    videoCount: number;
+    byKind: Partial<Record<MediaAssetKind, number>>;
+  };
+  provenance: Provenance;
+}
+
+export interface RemoveMediaAssetInput {
+  assetId?: string;
+  videoIdOrUrl?: string;
+  deleteFiles?: boolean;
+}
+
+export interface RemoveMediaAssetOutput {
+  removed: number;
+  freedBytes: number;
+  provenance: Provenance;
+}
+
+export interface ExtractKeyframesInput {
+  videoIdOrUrl: string;
+  intervalSec?: number;
+  maxFrames?: number;
+  imageFormat?: "jpg" | "png" | "webp";
+  width?: number;
+}
+
+export interface ExtractKeyframesOutput {
+  videoId: string;
+  framesExtracted: number;
+  assets: Array<{
+    assetId: string;
+    filePath: string;
+    timestampSec: number;
+    width?: number;
+    height?: number;
+    fileSizeBytes: number;
+  }>;
+  durationMs: number;
+  provenance: Provenance;
+}
+
+export interface MediaStoreHealthOutput {
+  dataDir: string;
+  assetsDir: string;
+  stats: {
+    totalAssets: number;
+    totalSizeBytes: number;
+    videoCount: number;
+    byKind: Partial<Record<MediaAssetKind, number>>;
+  };
+  ffmpegAvailable: boolean;
+  ffmpegVersion?: string;
+  ytdlpAvailable: boolean;
+  ytdlpVersion?: string;
   provenance: Provenance;
 }

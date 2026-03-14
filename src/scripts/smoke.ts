@@ -1,8 +1,12 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { YouTubeService } from "../lib/youtube-service.js";
 
 async function main(): Promise<void> {
   const dryRun = process.argv.includes("--dry-run");
-  const service = new YouTubeService({ dryRun });
+  const dataDir = dryRun ? mkdtempSync(join(tmpdir(), "youtube-mcp-smoke-")) : process.env.YOUTUBE_MCP_DATA_DIR;
+  const service = new YouTubeService({ dryRun, dataDir });
 
   const sampleVideo = "dQw4w9WgXcQ";
   const sampleChannel = "@GoogleDevelopers";
@@ -63,6 +67,61 @@ async function main(): Promise<void> {
           },
           { dryRun },
         ),
+    },
+    {
+      name: "importPlaylist",
+      run: () =>
+        service.importPlaylist(
+          {
+            playlistUrlOrId: samplePlaylist,
+            maxVideos: 2,
+            label: "Smoke Playlist",
+          },
+          { dryRun },
+        ),
+    },
+    {
+      name: "importVideos",
+      run: () =>
+        service.importVideos(
+          {
+            videoIdsOrUrls: [sampleVideo],
+            label: "Smoke Videos",
+          },
+          { dryRun },
+        ),
+    },
+    {
+      name: "setActiveCollection",
+      run: () => service.setActiveCollection({ collectionId: `playlist-${samplePlaylist}` }),
+    },
+    {
+      name: "searchTranscripts",
+      run: () => service.searchTranscripts({ query: "title patterns checklist", maxResults: 3 }),
+    },
+    {
+      name: "listCollections",
+      run: () => service.listCollections({ includeVideoList: true }),
+    },
+    {
+      name: "clearActiveCollection",
+      run: () => service.clearActiveCollection(),
+    },
+    {
+      name: "checkImportReadiness",
+      run: () => service.checkImportReadiness({ videoIdOrUrl: sampleVideo }, { dryRun }),
+    },
+    {
+      name: "buildVideoDossier",
+      run: () => service.buildVideoDossier({ videoIdOrUrl: sampleVideo, commentSampleSize: 3 }, { dryRun }),
+    },
+    {
+      name: "checkSystemHealth",
+      run: () => service.checkSystemHealth({}, { dryRun }),
+    },
+    {
+      name: "removeCollection",
+      run: () => service.removeCollection({ collectionId: `playlist-${samplePlaylist}` }),
     },
     {
       name: "scoreHookPatterns",

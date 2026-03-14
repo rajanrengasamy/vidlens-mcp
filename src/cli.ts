@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { startStdioServer } from "./server/mcp-server.js";
+import { runCli } from "./lib/cli-runtime.js";
 
-startStdioServer().catch((error) => {
+runCli(process.argv.slice(2)).catch((error) => {
   const message = error instanceof Error ? error.stack ?? error.message : String(error);
-  process.stderr.write(`youtube-mcp failed to start: ${message}\n`);
+  process.stderr.write(`youtube-mcp failed: ${message}\n`);
   process.exitCode = 1;
 });

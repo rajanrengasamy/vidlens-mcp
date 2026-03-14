@@ -29,23 +29,13 @@ test("public MCP surface uses intent-based tool names", () => {
     "researchTagsAndTitles",
     "compareShortsVsLong",
     "recommendUploadWindows",
-    // Trends & Discovery
-    "discoverNicheTrends",
-    "exploreNicheCompetitors",
     // Media / Asset tools
     "downloadAsset",
     "listMediaAssets",
     "removeMediaAsset",
     "extractKeyframes",
     "mediaStoreHealth",
-    // Comment Knowledge Base
-    "importComments",
-    "searchComments",
-    "listCommentCollections",
-    "setActiveCommentCollection",
-    "clearActiveCommentCollection",
-    "removeCommentCollection",
-  ]);
+    "discoverNicheTrends",
 });
 
 test("media tools have correct required fields", () => {
@@ -69,5 +59,6 @@ test("media tools have correct required fields", () => {
 
   const healthTool = tools.find((t) => t.name === "mediaStoreHealth");
   assert.ok(healthTool, "mediaStoreHealth tool should exist");
-  assert.equal((healthTool.inputSchema as any).required, undefined);
+    "exploreNicheCompetitors",
+  ]);
 });

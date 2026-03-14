@@ -1,7 +1,7 @@
 {
   "name": "youtube-mcp",
-  "version": "0.2.0",
-  "description": "Intent-first YouTube MCP server with API + yt-dlp + page extraction fallback and creator-analysis tools",
+  "version": "0.3.0",
+  "description": "Modular YouTube MCP platform: core transcript intelligence, audience/comment extensions, and diagnostics with API + yt-dlp + page extraction fallback",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -33,6 +33,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@google/genai": "^1.45.0",
     "@modelcontextprotocol/sdk": "^1.17.4",
     "execa": "^9.6.0"
   },

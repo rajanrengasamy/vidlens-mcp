@@ -2,7 +2,7 @@
 
 **Author:** Rajan Rengasamy
 **Date:** 2026-03-05
-**Status:** Draft v1.1 (updated: playlist imports + semantic search promoted to V1)
+**Status:** Draft v2.1 (updated: V2.16 — tonight's shipped V2 build: active collection, diagnostics, dossier, doctor CLI, client detection scaffolding, packaging/install UX)
 **Product Type:** Standalone TypeScript MCP server (stdio + SSE), npm-publishable
 
 ---
@@ -1489,3 +1489,1847 @@ I am positioning this product as:
 > **"The reliable, zero-config YouTube intelligence server for MCP workflows - with built-in semantic search."**
 
 The core value is not raw retrieval - it is dependable, compact, decision-ready intelligence that works even when ideal credentials are not available. The playlist import + semantic search workflow transforms YouTube from a passive video platform into a queryable knowledge base, all running locally with no API keys required.
+
+---
+---
+
+# V2 Extension — Lessons from Live Claude Desktop Testing
+
+**Added:** 2026-03-14
+**Status:** Implementation-ready specification
+**Context:** Real-world testing in Claude Desktop exposed eight categories of product gaps beyond the original feature catalog. This extension turns those gaps into concrete tool contracts, behavior rules, and defaults.
+
+**What is V2 vs Later:**
+- Everything in this section is **V2 scope** — implementable tonight by a coding agent.
+- V3 tools (benchmarkChannels, measureShareOfVoice, etc.) remain deferred per original roadmap.
+
+---
+
+## V2.1) Collection Scoping as a First-Class Concept
+
+### Problem Observed
+In live testing, Claude consistently had to guess or ask which collection to search. With multiple imported playlists, `searchTranscripts` without a `collectionId` searches everything — sometimes useful, often noisy. The LLM has no way to "focus" on a specific knowledge domain without memorizing collection IDs.
+
+### Product Behavior
+
+**Active Collection:** The server maintains an optional session-level "active collection" that automatically scopes KB tools when no explicit `collectionId` is provided.
+
+**Rules:**
+1. When `activeCollectionId` is set, `searchTranscripts`, `importVideos`, and `listCollections` default to it.
+2. When `collectionId` is explicitly passed, it overrides the active collection for that call only.
+3. When no active collection is set and no `collectionId` is passed, behavior is unchanged (search all / create new).
+4. Setting active collection to `null` clears it (returns to "search all" default).
+5. Active collection state persists for the lifetime of the MCP server process (not across restarts).
+
+### New Tool: `setActiveCollection`
+
+```ts
+export interface SetActiveCollectionInput {
+  collectionId: string | null; // null to clear
+}
+
+export interface SetActiveCollectionOutput {
+  activeCollectionId: string | null;
+  collectionLabel?: string;
+  videoCount?: number;
+  totalChunks?: number;
+  message: string; // human-readable confirmation for the LLM
+}
+```
+
+**Tool description:** `"Set the active collection for all subsequent knowledge base operations. Pass null to clear. When active, searchTranscripts and importVideos default to this collection without needing collectionId on every call."`
+
+### New Tool: `getActiveCollection`
+
+```ts
+export interface GetActiveCollectionOutput {
+  activeCollectionId: string | null;
+  collectionLabel?: string;
+  videoCount?: number;
+  totalChunks?: number;
+  embeddingProvider?: string;
+  embeddingModel?: string;
+}
+```
+
+**Tool description:** `"Check which collection is currently active for knowledge base operations. Returns null if no collection is scoped."`
+
+### Affected Existing Tools
+
+- `searchTranscripts`: If `collectionId` is omitted and active collection is set, use active collection. Response includes `scopedBy: "active_collection" | "explicit" | "all"` field.
+- `importVideos`: If `collectionId` is omitted and active collection is set, import into active collection.
+- `importPlaylist`: Unaffected — always creates/uses playlist-derived collection ID unless explicitly overridden.
+
+---
+
+## V2.2) Transcript Availability + Preflight Diagnostics
+
+### Problem Observed
+When Claude tries to import a playlist, some videos silently fail because transcripts are unavailable (live streams, music videos, explicit no-caption content). The LLM has no way to check before committing to a batch import. This leads to confusing partial failures.
+
+### New Tool: `preflightTranscript`
+
+Pre-check transcript availability for one or more videos without fetching full content. Fast, cheap, no embedding work.
+
+```ts
+export interface PreflightTranscriptInput {
+  videoIdsOrUrls: string[]; // 1..50
+  language?: string; // preferred language
+}
+
+export interface PreflightTranscriptOutput {
+  results: Array<{
+    videoId: string;
+    title?: string;
+    transcriptAvailable: boolean;
+    availableLanguages?: string[];
+    sourceType?: "manual_caption" | "auto_caption" | "unknown";
+    estimatedCharacters?: number; // rough size hint
+    estimatedTokens?: number;
+    qualityHint?: "high" | "medium" | "low" | "unknown"; // based on source type + language match
+    reason?: string; // why unavailable, e.g. "live stream", "no captions", "private video"
+  }>;
+  summary: {
+    total: number;
+    available: number;
+    unavailable: number;
+    availablePct: number;
+  };
+  provenance: Provenance;
+}
+```
+
+**Tool description:** `"Pre-check transcript availability for videos before importing. Returns availability, languages, quality hints, and size estimates. Use before importPlaylist/importVideos to avoid surprise failures."`
+
+### Quality Hint Rules
+- `"high"`: manual captions in requested language
+- `"medium"`: auto-captions in requested language, or manual captions in different language
+- `"low"`: auto-captions in different language only
+- `"unknown"`: could not determine source type
+
+---
+
+## V2.3) Sparse / Low-Quality Transcript Fallback Rules
+
+### Problem Observed
+Some videos have auto-generated transcripts that are borderline useless — garbled text, music lyrics repeated, or extremely sparse (e.g., a 30-minute video with 200 characters of transcript). These get indexed and pollute search results.
+
+### Product Behavior
+
+**Minimum quality gate on import:**
+1. If transcript text is < 200 characters for a video > 60 seconds, mark as `quality: "insufficient"` and skip indexing by default.
+2. If transcript `sourceType` is `"auto_caption"` and average word confidence (when available) is < 0.4, mark as `quality: "low"` and emit a warning in import output.
+3. New optional parameter on import tools: `minTranscriptQuality?: "any" | "low" | "medium" | "high"` (default `"low"`).
+   - `"any"`: import everything, even garbled text.
+   - `"low"`: skip only truly insufficient transcripts (< 200 chars for > 60s video).
+   - `"medium"`: require auto-caption or better.
+   - `"high"`: require manual captions only.
+
+### Import Output Extension
+
+Add to `ImportPlaylistOutput` and `ImportVideosOutput`:
+
+```ts
+qualityReport?: {
+  skippedLowQuality: number;
+  skippedNoTranscript: number;
+  warnings: Array<{
+    videoId: string;
+    reason: string; // "transcript too sparse (142 chars for 1800s video)", "auto-caption confidence 0.31"
+  }>;
+};
+```
+
+---
+
+## V2.4) Unified Video Dossier Workflow
+
+### Problem Observed
+In testing, Claude frequently needed to "fully understand" a single video — metadata, transcript, comments, sentiment, and provenance — but had to make 3-4 separate tool calls. This is slow, token-heavy (repeated provenance/metadata), and error-prone (partial failures across calls).
+
+### New Tool: `buildVideoDossier`
+
+One-call deep analysis of a single video. Returns a unified, compact dossier that combines everything the LLM needs to reason about a video.
+
+```ts
+export interface BuildVideoDossierInput extends TokenControls {
+  videoIdOrUrl: string;
+  includeSections?: Array<
+    "metadata" | "transcript" | "comments" | "sentiment" | "hooks"
+  >; // default all
+  transcriptMode?: "summary" | "key_moments" | "chapters" | "full"; // default "key_moments"
+  commentsSampleSize?: number; // default 100
+  language?: string;
+}
+
+export interface BuildVideoDossierOutput {
+  videoId: string;
+  title: string;
+  channelTitle: string;
+  url: string;
+
+  metadata?: {
+    publishedAt?: string;
+    durationSec?: number;
+    category?: string;
+    tags?: string[];
+    language?: string;
+    views?: number;
+    likes?: number;
+    comments?: number;
+    likeRate?: number;
+    commentRate?: number;
+  };
+
+  transcript?: {
+    available: boolean;
+    sourceType?: "manual_caption" | "auto_caption" | "generated_from_audio" | "unknown";
+    languageUsed?: string;
+    mode: string;
+    text?: string;
+    segments?: TranscriptSegment[];
+    chapters?: Chapter[];
+    totalCharacters?: number;
+    qualityHint?: "high" | "medium" | "low" | "unknown";
+  };
+
+  comments?: {
+    totalFetched: number;
+    threads: ReadCommentsOutput["threads"];
+  };
+
+  sentiment?: {
+    sampleSize: number;
+    positivePct: number;
+    neutralPct: number;
+    negativePct: number;
+    sentimentScore: number;
+    themes?: MeasureAudienceSentimentOutput["themes"];
+    riskSignals?: MeasureAudienceSentimentOutput["riskSignals"];
+    representativeQuotes?: MeasureAudienceSentimentOutput["representativeQuotes"];
+  };
+
+  hooks?: {
+    hookScore: number;
+    hookType: string;
+    first30SecSummary: string;
+    weakSignals: string[];
+    improvements: string[];
+  };
+
+  // Single provenance covering the whole dossier
+  provenance: Provenance & {
+    sectionsAttempted: string[];
+    sectionsSucceeded: string[];
+    sectionsFailed: Array<{ section: string; error: string }>;
+  };
+}
+```
+
+**Tool description:** `"Build a complete dossier for a single video: metadata, transcript, comments, sentiment, and hook analysis in one call. Specify which sections you need. Partial success is allowed — failed sections are reported, not fatal."`
+
+**Behavior:**
+- Sections execute in parallel where possible (metadata + transcript can run concurrently with comments).
+- A failed section does not fail the dossier — it's reported in `provenance.sectionsFailed`.
+- Single provenance block covers the whole dossier with per-section success/failure tracking.
+
+---
+
+## V2.5) Comment-Aware Knowledge Base
+
+### Problem Observed
+Comments contain valuable audience signal — questions, complaints, feature requests, cultural references — but they're not searchable in the KB. The current `readComments` + `measureAudienceSentiment` tools work per-video, but there's no way to search across comment corpora semantically (e.g., "find all comments asking about pricing across my imported videos").
+
+### Product Behavior
+
+**Optional comment indexing during import.** Comments are NOT indexed by default (they're noisy and large). Users opt in explicitly.
+
+### Extended Import Parameters
+
+Add to `importPlaylist` and `importVideos` input schemas:
+
+```ts
+indexComments?: boolean; // default false
+commentsPerVideo?: number; // default 50, max 200
+commentChunkSize?: number; // default 20 comments per chunk
+```
+
+When `indexComments: true`:
+1. Fetch top comments for each video during import.
+2. Group comments into chunks of `commentChunkSize` comments each.
+3. Embed and index comment chunks alongside transcript chunks.
+4. Comment chunks are tagged with `chunkType: "comment"` to distinguish from transcript chunks.
+
+### Extended Search
+
+Add to `searchTranscripts` input schema:
+
+```ts
+chunkTypes?: Array<"transcript" | "comment">; // default ["transcript"] — must opt in to comments
+```
+
+Search results include:
+
+```ts
+// Added to each result item:
+chunkType: "transcript" | "comment"; // so the LLM knows what it's reading
+```
+
+### New Tool: `searchComments`
+
+Convenience wrapper that searches only comment chunks. Equivalent to `searchTranscripts` with `chunkTypes: ["comment"]`.
+
+```ts
+export interface SearchCommentsInput {
+  query: string;
+  collectionId?: string; // defaults to active collection if set
+  maxResults?: number; // default 10
+  minScore?: number; // default 0.3
+  videoIdFilter?: string[];
+}
+
+export interface SearchCommentsOutput {
+  query: string;
+  results: Array<{
+    collectionId: string;
+    videoId: string;
+    videoTitle: string;
+    channelTitle?: string;
+    commentTexts: string[]; // the comments in this chunk
+    score: number;
+    lexicalScore?: number;
+    semanticScore?: number;
+  }>;
+  searchMeta: {
+    totalChunksSearched: number;
+    embeddingModel: string;
+    searchLatencyMs: number;
+  };
+  provenance: Provenance;
+}
+```
+
+**Tool description:** `"Search across indexed comments in the knowledge base. Only available for collections imported with indexComments: true. Find audience questions, complaints, and patterns across videos."`
+
+### Schema Extension
+
+Add to `transcript_chunks` table:
+
+```sql
+ALTER TABLE transcript_chunks ADD COLUMN chunk_type TEXT NOT NULL DEFAULT 'transcript';
+-- Values: 'transcript' | 'comment'
+```
+
+---
+
+## V2.6) Credential Model + Auth/Health Diagnostics
+
+### Problem Observed
+In Claude Desktop testing, the most common "why isn't this working?" moment was credential misconfiguration — API key not set, Gemini key expired, yt-dlp not on PATH, data directory permissions. The LLM had no way to diagnose these without trial-and-error tool calls.
+
+### New Tool: `checkHealth`
+
+```ts
+export interface CheckHealthOutput {
+  server: {
+    version: string;
+    uptime: number; // seconds
+    nodeVersion: string;
+    platform: string;
+  };
+
+  credentials: {
+    youtubeApiKey: {
+      configured: boolean;
+      valid?: boolean; // null if not tested yet
+      quotaRemaining?: number; // if testable
+    };
+    geminiApiKey: {
+      configured: boolean;
+      valid?: boolean;
+    };
+  };
+
+  runtime: {
+    ytDlpAvailable: boolean;
+    ytDlpVersion?: string;
+    ytDlpPath?: string;
+    dataDir: string;
+    dataDirWritable: boolean;
+    knowledgeBaseExists: boolean;
+    knowledgeBaseSizeBytes?: number;
+  };
+
+  activeCollection?: {
+    collectionId: string;
+    label?: string;
+    videoCount: number;
+    totalChunks: number;
+  };
+
+  capabilities: {
+    canSearch: boolean; // yt-dlp or API key present
+    canFetchComments: boolean; // API key present (comments need API)
+    canEmbed: boolean; // local always true; gemini needs key
+    canImport: boolean; // yt-dlp available
+    embeddingProvider: string; // "local" | "gemini"
+  };
+
+  issues: Array<{
+    severity: "error" | "warning" | "info";
+    component: string;
+    message: string;
+    suggestion: string;
+  }>;
+}
+```
+
+**Tool description:** `"Check server health, credential status, runtime dependencies, and capabilities. Use this first when things aren't working, or to understand what features are available."`
+
+**Behavior:**
+- No input required — zero-arg tool.
+- Fast — should return in < 500ms. Does NOT make upstream API calls to validate keys by default.
+- `issues[]` proactively surfaces problems: "yt-dlp not found on PATH — transcript fallback and imports will fail", "GEMINI_API_KEY not set — using local embeddings (lower quality)", etc.
+
+### Credential Validation Rules
+
+| Credential | How to check | When to check |
+|---|---|---|
+| `YOUTUBE_API_KEY` | Env var presence | On server start, on `checkHealth` |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Env var presence | On server start, on `checkHealth` |
+| `yt-dlp` | `which yt-dlp` / `where yt-dlp` | On server start, on `checkHealth` |
+| Data dir | `fs.accessSync(dir, W_OK)` | On server start, on `checkHealth` |
+
+---
+
+## V2.7) Client-Runtime Ergonomics
+
+### Problem Observed
+Claude Desktop (and similar MCP clients) has specific behaviors that affect the user experience:
+1. `npx` resolution can fail if the user's PATH doesn't include npm/node.
+2. The data directory default (`~/Library/Application Support/youtube-mcp/`) is macOS-specific.
+3. First-run local embedding model download (~80MB) blocks with no progress feedback in MCP stdio mode.
+4. Error messages from the server are often too technical for the LLM to actionably present to the user.
+
+### Product Behavior
+
+**1. Cross-platform data directory defaults:**
+
+```ts
+function defaultDataDir(): string {
+  if (process.env.YOUTUBE_MCP_DATA_DIR) return process.env.YOUTUBE_MCP_DATA_DIR;
+
+  switch (process.platform) {
+    case "darwin":
+      return join(homedir(), "Library", "Application Support", "youtube-mcp");
+    case "win32":
+      return join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "youtube-mcp");
+    default: // linux, etc.
+      return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "youtube-mcp");
+  }
+}
+```
+
+**2. Startup diagnostics on stderr:**
+
+On server start, emit a brief diagnostic block to stderr (not stdout, which is MCP transport):
+
+```
+youtube-mcp v0.3.0 starting
+  data dir: /Users/rajan/Library/Application Support/youtube-mcp
+  yt-dlp: /opt/homebrew/bin/yt-dlp (2025.01.15)
+  youtube api: configured
+  embeddings: gemini (gemini-embedding-2-preview, 768d)
+  knowledge base: 3 collections, 847 chunks
+```
+
+**3. LLM-friendly error messages:**
+
+Every `GracefulError` must include a `userFriendlyMessage` field — a plain-English sentence the LLM can relay directly to the user without reformulation:
+
+```ts
+export interface GracefulError {
+  code: string;
+  message: string; // technical
+  userFriendlyMessage: string; // "I couldn't find captions for this video. It might be a live stream or music video without subtitles."
+  retryable: boolean;
+  attemptedTiers: SourceTier[];
+  suggestion?: string;
+}
+```
+
+**4. Collection context in tool responses:**
+
+When an active collection is set, include it in relevant tool responses so the LLM always knows where it's working:
+
+```ts
+// Added to searchTranscripts, importVideos responses:
+context?: {
+  activeCollectionId?: string;
+  activeCollectionLabel?: string;
+  scopedBy: "active_collection" | "explicit" | "all";
+};
+```
+
+---
+
+## V2.8) Implementation Readiness Checklist (V2 Extension)
+
+- [ ] `setActiveCollection` + `getActiveCollection` tools
+- [ ] Active collection scoping in `searchTranscripts` and `importVideos`
+- [ ] `preflightTranscript` tool
+- [ ] Transcript quality gate on import (min chars, source type check)
+- [ ] `qualityReport` in import outputs
+- [ ] `buildVideoDossier` tool with parallel section execution
+- [ ] `indexComments` parameter on import tools
+- [ ] Comment chunk storage (`chunk_type` column migration)
+- [ ] `chunkTypes` filter on `searchTranscripts`
+- [ ] `searchComments` convenience tool
+- [ ] `checkHealth` tool
+- [ ] Cross-platform `defaultDataDir`
+- [ ] Startup diagnostics on stderr
+- [ ] `userFriendlyMessage` on all `GracefulError` instances
+- [ ] `context` block in KB tool responses
+- [ ] Schema migration for `chunk_type` column (backward-compatible ALTER TABLE)
+
+---
+
+## V2.9) Schema Migration Strategy
+
+The V2 extension requires one schema change to the `transcript_chunks` table:
+
+```sql
+-- Migration 001: Add chunk_type column
+ALTER TABLE transcript_chunks ADD COLUMN chunk_type TEXT NOT NULL DEFAULT 'transcript';
+```
+
+**Migration rules:**
+1. Run on knowledge base open (in `TranscriptKnowledgeBase` constructor).
+2. Use `PRAGMA user_version` to track migration state.
+3. If column already exists, skip silently.
+4. Default value `'transcript'` ensures backward compatibility — existing chunks are correctly typed.
+
+---
+
+## V2.10) Updated Tool Catalog Summary
+
+After V2, the full tool surface is:
+
+| Tool | Category | V1/V2 | Status |
+|---|---|---|---|
+| `findVideos` | Core retrieval | V1 | Shipped |
+| `inspectVideo` | Core retrieval | V1 | Shipped |
+| `inspectChannel` | Core retrieval | V1 | Shipped |
+| `listChannelCatalog` | Core retrieval | V1 | Shipped |
+| `readTranscript` | Core retrieval | V1 | Shipped |
+| `readComments` | Core retrieval | V1 | Shipped |
+| `measureAudienceSentiment` | Analysis | V1 | Shipped |
+| `analyzeVideoSet` | Batch | V1 | Shipped |
+| `expandPlaylist` | Batch | V1 | Shipped |
+| `analyzePlaylist` | Batch | V1 | Shipped |
+| `importPlaylist` | Knowledge Base | V1 | Shipped (extend for V2) |
+| `importVideos` | Knowledge Base | V1 | Shipped (extend for V2) |
+| `searchTranscripts` | Knowledge Base | V1 | Shipped (extend for V2) |
+| `listCollections` | Knowledge Base | V1 | Shipped |
+| `removeCollection` | Knowledge Base | V1 | Shipped |
+| `scoreHookPatterns` | Creator Intel | V1.5 | Shipped |
+| `researchTagsAndTitles` | Creator Intel | V1.5 | Shipped |
+| `compareShortsVsLong` | Creator Intel | V1.5 | Shipped |
+| `recommendUploadWindows` | Creator Intel | V1.5 | Shipped |
+| **`setActiveCollection`** | **Session** | **V2** | **New** |
+| **`getActiveCollection`** | **Session** | **V2** | **New** |
+| **`preflightTranscript`** | **Diagnostics** | **V2** | **New** |
+| **`buildVideoDossier`** | **Analysis** | **V2** | **New** |
+| **`searchComments`** | **Knowledge Base** | **V2** | **New** |
+| **`checkHealth`** | **Diagnostics** | **V2** | **New** |
+| `watchTopicTrends` | **Discovery / Trends** | V1 | Shipped (repositioned from Core) |
+| **`analyzeNicheTrends`** | **Discovery / Trends** | **V2.5** | **New — hero tool** |
+| **`compareNiches`** | **Discovery / Trends** | **V2.5** | **New** |
+| **`trackNicheOverTime`** | **Discovery / Trends** | **V2.5** | **New** |
+
+**Total: 28 tools** (19 shipped + 6 V2 new + 3 Discovery/Trends new)
+
+---
+
+## V2.11) Risks and Mitigations (V2 Specific)
+
+### Risk: Comment indexing bloats knowledge base
+**Mitigation:** Off by default. `commentsPerVideo` capped at 200. Comment chunks clearly tagged for separate filtering. `removeCollection` wipes everything including comments.
+
+### Risk: Active collection state causes confusion if LLM forgets context
+**Mitigation:** Every KB response includes `context.activeCollectionId`. `checkHealth` surfaces it. `getActiveCollection` is a zero-cost check. Active collection is process-scoped — server restart clears it.
+
+### Risk: Schema migration breaks existing databases
+**Mitigation:** `ALTER TABLE ADD COLUMN` with `DEFAULT` is non-destructive in SQLite. Migration gated behind `PRAGMA user_version`. Tested against empty DB and populated DB.
+
+### Risk: `buildVideoDossier` is slow for long videos
+**Mitigation:** Default transcript mode is `key_moments` (not `full`). Sections run in parallel. Individual section timeout of 30s. LLM can select which sections it needs via `includeSections`.
+
+### Risk: `checkHealth` leaks sensitive info
+**Mitigation:** Never returns API key values — only `configured: true/false`. Path information is limited to data dir and yt-dlp location (both already visible to the process). No network calls by default.
+
+---
+
+## V2.12) Modular Product Architecture
+
+### Design Philosophy
+
+YouTube MCP is a **platform with modules**, not a monolith. Each module is a coherent feature surface that can be enabled independently. The base/core module is always present. Extension modules register additional tools, may require additional credentials or dependencies, and declare their own capability requirements.
+
+This architecture serves three goals:
+1. **Keep the default tool surface lean.** A user who just wants transcripts shouldn't see 30 tools.
+2. **Enable progressive capability.** Users add modules as their needs grow.
+3. **Isolate dependencies.** Frame-level search needs ffmpeg + a vision model. Comment sentiment needs an LLM. Neither should block the core from working.
+
+### Module Map
+
+| Module | Scope | Default? | Dependencies Beyond Core | Status |
+|---|---|---|---|---|
+| **Core** | Video/channel/playlist retrieval, transcripts, fallback chain, provenance | Always on | `yt-dlp` (optional but strongly recommended) | **Shipped** |
+| **Knowledge Base** | Transcript import, semantic search, collections, active collection | Always on | Embedding provider (local built-in or Gemini) | **Shipped** |
+| **Sentiment** | Comment sentiment analysis, themes, risk signals, representative quotes | Always on | None (heuristic-based) | **Shipped** |
+| **Creator Intel** | Hook scoring, tag/title research, Shorts vs long-form, upload windows | Always on | None | **Shipped** |
+| **Batch** | Multi-video analysis, playlist analysis, video set analysis | Always on | None | **Shipped** |
+| **Diagnostics** | Health check, preflight transcript, active collection management | Always on | None | **V2 — build tonight** |
+| **Dossier** | Unified single-video deep analysis | Always on | None | **V2 — build tonight** |
+| **Comment KB** | Comment indexing + semantic search across comment corpora | Always on | None | **V2.17 — Shipped** |
+| **Media / Assets** | Video/audio download, asset management, keyframe extraction | Always on | `yt-dlp`, `ffmpeg` (for keyframes) | **V2.17 — Shipped** |
+| **Discovery / Trends** | Niche trend analysis, momentum, saturation, competitor landscape, content gaps | Always on | None (better with YouTube API key) | **V2.17 — Shipped** |
+| **Visual Search** | Frame-level indexing, scene search, visual Q&A over video content | **Opt-in** (future) | `ffmpeg`, vision model (Gemini), large storage | **V3 — design now, build later** |
+| **Competitive Intel** | Channel benchmarking, share of voice, growth trajectory, sponsorship detection | **Opt-in** (future) | YouTube API key (required, not optional) | **V3 — per original roadmap** |
+
+### Module Registration Model
+
+**V2 implementation (tonight):** Modules are not yet runtime-pluggable. The architecture is expressed through:
+1. **Tool grouping** — tools are logically grouped by module in the codebase (`src/modules/core/`, `src/modules/kb/`, etc. or equivalent flat structure with clear naming).
+2. **Capability gating** — opt-in tools only register when their config flag is set (already done for `downloadVideo`).
+3. **`checkHealth` output** — lists which modules are active and their capability status.
+
+**Future (post-V3):** True plugin architecture where modules are separate npm packages that register tools at startup.
+
+### Module Detail: Core
+
+**Always present. Zero-config.**
+
+Tools: `findVideos`, `inspectVideo`, `inspectChannel`, `listChannelCatalog`, `readTranscript`, `readComments`, `expandPlaylist`
+
+This module handles all data retrieval with the fallback chain. It is the foundation everything else builds on.
+
+### Module Detail: Knowledge Base
+
+**Always present. The main differentiator.**
+
+Tools: `importPlaylist`, `importVideos`, `searchTranscripts`, `listCollections`, `removeCollection`, `setActiveCollection`, `getActiveCollection`
+
+Operates on **transcript text**. Embeddings are generated from transcript chunk text. Search is semantic over words/concepts, not over visual content.
+
+**What transcript-level search can do:**
+- Find mentions of a topic across hours of video ("where does he discuss gradient descent?")
+- Locate specific explanations, arguments, or instructions
+- Cross-reference concepts across multiple creators or lecture series
+
+**What transcript-level search cannot do:**
+- Identify what's shown on screen (diagrams, code, slides, faces)
+- Find visual moments ("the part where he draws the architecture diagram")
+- Answer questions about visual content not verbalized in speech
+
+This distinction matters. The Knowledge Base module is powerful for spoken content. For visual content, see the Visual Search module below.
+
+### Module Detail: Comment KB (Opt-in Extension)
+
+**Enabled per-import with `indexComments: true`.**
+
+Tools: `searchComments` (new)
+Extended tools: `searchTranscripts` gains `chunkTypes` filter
+
+Comments are indexed as text chunks alongside transcripts. They use the same embedding pipeline and collection structure. The `chunkType` field distinguishes them.
+
+### Module Detail: Download (Opt-in Extension)
+
+**Enabled via `YOUTUBE_MCP_ENABLE_DOWNLOAD=true`.**
+
+Tools: `downloadVideo` (already spec'd in V1 PRD)
+
+Downloads video/audio files via `yt-dlp`. Files are stored locally at a configurable path.
+
+**V2 scope extension — Asset Management:**
+
+When download is enabled, downloaded files should be trackable:
+
+```ts
+export interface DownloadVideoOutput {
+  videoId: string;
+  title: string;
+  filePath: string; // absolute path to downloaded file
+  fileSize: number;
+  format: string;
+  quality: string;
+  durationSec?: number;
+  provenance: Provenance;
+}
+```
+
+Add a new tool for managing downloaded assets:
+
+#### Tool: `listDownloads`
+
+```ts
+export interface ListDownloadsInput {
+  collectionId?: string; // filter by collection
+  format?: string; // filter by format
+}
+
+export interface ListDownloadsOutput {
+  downloads: Array<{
+    videoId: string;
+    title: string;
+    filePath: string;
+    fileSize: number;
+    format: string;
+    downloadedAt: string;
+    collectionId?: string;
+  }>;
+  totalSizeBytes: number;
+  provenance: Provenance;
+}
+```
+
+This enables workflows like: "download all videos in this playlist, then later process them for frame extraction."
+
+**Schema extension:**
+```sql
+CREATE TABLE IF NOT EXISTS downloaded_assets (
+  video_id TEXT NOT NULL,
+  collection_id TEXT,
+  file_path TEXT NOT NULL,
+  file_size INTEGER NOT NULL,
+  format TEXT NOT NULL,
+  quality TEXT,
+  downloaded_at TEXT NOT NULL,
+  PRIMARY KEY (video_id, format)
+);
+```
+
+### Module Detail: Visual Search (Future — V3+)
+
+**This is the big one. Distinct from transcript search. Requires significant additional infrastructure.**
+
+#### What Visual Search Actually Requires
+
+Transcript-level semantic search works because transcripts are text — embed text, search text. Visual search over video content is a fundamentally different problem. Here is what's required, honestly:
+
+**1. Frame Extraction Pipeline**
+- Dependency: `ffmpeg` (already common, but not trivial)
+- Extract keyframes at configurable intervals (e.g., every 5s, or scene-change detection)
+- For a 1-hour video at 1 frame/5s: 720 frames → ~50-150MB of images
+- Storage: frames stored locally alongside knowledge base or in a configurable media directory
+
+**2. Scene Segmentation**
+- Group consecutive similar frames into "scenes"
+- Each scene = a time range with representative frames
+- Reduces 720 frames to ~30-80 meaningful scenes
+- Can be done with pixel-hash similarity (fast, local) or model-based (slower, better)
+
+**3. Visual Description Generation**
+- Each scene's representative frame(s) need a text description
+- Options:
+  - **Gemini Vision** (`gemini-2.0-flash` or similar) — best quality, requires API key, ~$0.001/image
+  - **Local vision model** (LLaVA, etc.) — free, slower, lower quality
+  - **OCR** (Tesseract) — extracts on-screen text (slides, code, captions burned into video)
+- Output: per-scene text description ("Slide showing a neural network architecture diagram with 3 hidden layers. Title reads 'Backpropagation Overview'.")
+
+**4. Multimodal Embedding**
+- Embed the visual descriptions (and optionally raw frame embeddings) alongside transcript chunks
+- Each scene becomes a searchable chunk with:
+  - Visual description text
+  - OCR-extracted text (if any)
+  - Corresponding transcript text from that time range
+  - Frame thumbnail reference
+  - Time range
+
+**5. Unified Search**
+- Query searches across both transcript chunks AND visual description chunks
+- Results include frame thumbnails and timestamp deep links
+- The LLM can distinguish "he said X" from "the slide showed X"
+
+#### Visual Search — Honest Cost Analysis
+
+| Component | Per 1-hour video | Dependency |
+|---|---|---|
+| Frame extraction | ~5-30s (ffmpeg) | ffmpeg |
+| Scene segmentation | ~2-5s (local hash) | None |
+| Visual descriptions | ~30-120s, ~$0.05-0.15 | Gemini Vision API |
+| OCR | ~10-30s (local) | Tesseract (optional) |
+| Embedding | ~2-5s | Same as transcript embedding |
+| Storage | ~50-200MB frames + ~1MB descriptions | Disk |
+
+**Total per hour of video:** ~1-3 minutes processing, ~$0.05-0.15 API cost, ~50-200MB storage.
+
+This is feasible but not cheap at scale. A 50-video playlist = ~$2.50-7.50 in API costs + several GB of frame storage.
+
+#### Visual Search — Proposed Tool Surface (V3)
+
+```ts
+// Import with visual indexing
+export interface ImportVisualInput {
+  videoIdsOrUrls: string[];
+  collectionId?: string;
+  frameIntervalSec?: number; // default 5
+  sceneDetection?: boolean; // default true (group similar frames)
+  includeOcr?: boolean; // default true
+  visionModel?: string; // default "gemini-2.0-flash"
+  storeFrames?: boolean; // default true — save extracted frames to disk
+}
+
+// Search that spans transcript + visual
+export interface SearchVisualInput {
+  query: string;
+  collectionId?: string;
+  searchTypes?: Array<"transcript" | "visual" | "ocr">; // default all
+  maxResults?: number;
+}
+
+// Result includes visual context
+export interface VisualSearchResult {
+  videoId: string;
+  videoTitle: string;
+  chunkType: "transcript" | "visual_scene" | "ocr_text";
+  text: string; // transcript text OR visual description OR OCR text
+  tStartSec: number;
+  tEndSec: number;
+  timestampUrl: string;
+  score: number;
+  framePath?: string; // local path to representative frame (if storeFrames=true)
+}
+```
+
+#### Visual Search — What We Build Tonight (V2)
+
+**Nothing.** Visual search is a V3 feature. But tonight's V2 build should:
+1. Keep `chunk_type` extensible — the column supports future values beyond `"transcript"` and `"comment"` (e.g., `"visual_scene"`, `"ocr_text"`).
+2. Keep the embedding pipeline provider-agnostic — Gemini embeddings already work, and visual descriptions will use the same embedding path.
+3. Keep the download module's asset tracking in place — frame extraction will use downloaded video files as source material.
+
+The architecture tonight should not block Visual Search later. That's the design constraint.
+
+---
+
+## V2.13) Module Capability Matrix
+
+This matrix shows what each module needs and what it provides, so a coding agent (or user) can reason about trade-offs:
+
+| Module | Needs API Key? | Needs yt-dlp? | Needs ffmpeg? | Needs Vision Model? | Disk Impact | Token Cost |
+|---|---|---|---|---|---|---|
+| Core | Optional (better with) | Recommended | No | No | ~1MB (cache) | Low |
+| Knowledge Base | No (local embed) or Gemini key | Yes (for transcripts) | No | No | ~5-50MB per collection | Low |
+| Sentiment | No | No (uses comments from Core) | No | No | None | Low |
+| Creator Intel | No | No (uses data from Core) | No | No | None | Low |
+| Batch | Same as Core | Same as Core | No | No | None | Medium |
+| Diagnostics | No | No | No | No | None | Minimal |
+| Dossier | Same as Core | Same as Core | No | No | None | Medium |
+| Comment KB | No | No (uses comments from Core) | No | No | ~1-10MB per collection | Low |
+| Download | No | **Yes (required)** | No | No | **Large** (video files) | None |
+| Discovery / Trends | Optional (better demand signals with) | Recommended | No | No | ~1MB (snapshots) | Medium-High |
+| Visual Search | **Gemini key** | Yes | **Yes (required)** | **Yes (required)** | **Very large** | High |
+| Competitive Intel | **Yes (required)** | No | No | No | ~1MB (cache) | Medium |
+
+### `checkHealth` Module Awareness
+
+The `checkHealth` tool (V2.6) should report module status:
+
+```ts
+// Extended checkHealth output
+modules: {
+  core: { enabled: true, healthy: boolean };
+  knowledgeBase: { enabled: true, healthy: boolean, embeddingProvider: string };
+  sentiment: { enabled: true };
+  creatorIntel: { enabled: true };
+  batch: { enabled: true };
+  diagnostics: { enabled: true };
+  dossier: { enabled: true };
+  commentKb: { enabled: true }; // always available, activated per-import
+  download: { enabled: boolean, reason?: string }; // gated by env var
+  visualSearch: { enabled: false, reason: "V3 — not yet implemented" };
+  competitiveIntel: { enabled: false, reason: "V3 — not yet implemented" };
+};
+```
+
+---
+
+## V2.14) Updated Implementation Readiness Checklist (Modular Architecture)
+
+In addition to V2.8 checklist items:
+
+- [ ] `checkHealth` includes `modules` status block
+- [ ] `chunk_type` column values documented as extensible (`transcript`, `comment`, and future: `visual_scene`, `ocr_text`)
+- [ ] Download module: `listDownloads` tool + `downloaded_assets` table schema
+- [ ] Download module: asset tracking in `downloadVideo` output (persist to `downloaded_assets`)
+- [ ] Startup stderr diagnostics include module status summary
+- [ ] README update: module table showing what's available and what each needs
+
+---
+
+## V2.15) Packaging, Installation & User Onboarding Architecture
+
+**Added:** 2026-03-14
+**Context:** Product direction requires explicit packaging/install design. The server must be installable by end users who are NOT developers — they want `npx youtube-mcp` to work, or a setup wizard that configures their MCP client automatically.
+
+### Packaging Goals
+
+1. **Zero-config first run.** `npx youtube-mcp` starts the server and serves tools. No API key needed for core functionality (transcripts, search, metadata via yt-dlp).
+2. **One-command install.** `npm install -g youtube-mcp` or `npx youtube-mcp` — no cloning repos, no manual build step.
+3. **Client auto-detection.** The server (or a setup subcommand) detects which MCP clients are installed and offers to configure them.
+4. **Key transparency.** Users understand exactly what each API key unlocks and what works without it.
+5. **Diagnostics on demand.** `youtube-mcp doctor` validates the full stack (node version, yt-dlp, API keys, data dir, client config).
+
+### Supported Client Detection Concept
+
+The `youtube-mcp setup` command (or interactive first-run wizard) should detect the presence of known MCP clients and offer to write their config files.
+
+| Client | Config Location | Detection Method | Config Format |
+|---|---|---|---|
+| **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), `%APPDATA%/Claude/claude_desktop_config.json` (Windows) | File existence | JSON — add `mcpServers.youtube-mcp` entry |
+| **Claude Code** | Project-level `.mcp.json` or `~/.claude/settings.json` | Check for `claude` CLI on PATH + config file | JSON — `mcpServers` entry |
+| **Cursor** | `~/.cursor/mcp.json` | File/directory existence | JSON — `mcpServers` entry |
+| **VS Code (Copilot MCP)** | `.vscode/mcp.json` or `settings.json` | `code` CLI on PATH + settings directory | JSON — MCP server entry |
+| **ChatGPT Desktop** | Platform-specific MCP config (TBD — evolving) | File existence when standardized | JSON |
+| **Codex CLI** | Environment variable / project config | `codex` on PATH | Env-based |
+| **Windsurf** | `~/.windsurf/mcp.json` | File/directory existence | JSON — `mcpServers` entry |
+| **Custom / Manual** | User-specified | Always available as fallback | Prints config snippet to paste |
+
+**Detection flow:**
+1. Scan for known config file paths.
+2. Present a list of detected clients with checkboxes (interactive) or auto-configure all (non-interactive `--auto` flag).
+3. For each selected client, write (or merge into) the config file.
+4. Print a summary of what was configured and what the user needs to do next (e.g., "Restart Claude Desktop to pick up the new server").
+
+**Config entry template (all clients follow a similar pattern):**
+```json
+{
+  "youtube-mcp": {
+    "command": "npx",
+    "args": ["-y", "youtube-mcp"],
+    "env": {
+      "YOUTUBE_API_KEY": "${YOUTUBE_API_KEY}",
+      "GEMINI_API_KEY": "${GEMINI_API_KEY}"
+    }
+  }
+}
+```
+
+### Setup Flow / Onboarding Expectations
+
+**Interactive setup (`youtube-mcp setup`):**
+
+```
+$ youtube-mcp setup
+
+🎬 YouTube MCP Server Setup
+
+Checking system requirements...
+  ✅ Node.js v22.3.0
+  ✅ yt-dlp v2025.01.15 (/opt/homebrew/bin/yt-dlp)
+  ⚠️  YOUTUBE_API_KEY not set (optional — core works without it)
+  ⚠️  GEMINI_API_KEY not set (optional — local embeddings used instead)
+
+Detected MCP clients:
+  ✅ Claude Desktop (~/Library/Application Support/Claude/)
+  ✅ Claude Code (~/.claude/)
+  ❌ Cursor (not found)
+  ❌ VS Code MCP (not found)
+
+Configure Claude Desktop? [Y/n] y
+  → Updated claude_desktop_config.json
+  → Restart Claude Desktop to activate
+
+Configure Claude Code? [Y/n] y
+  → Updated ~/.claude/settings.json
+
+Setup complete! Try asking Claude: "Import this playlist and search for machine learning"
+```
+
+**Non-interactive setup (`youtube-mcp setup --auto`):**
+- Auto-configures all detected clients without prompting.
+- Suitable for CI/automation or users who just want it to work.
+
+**First-run behavior (no setup command):**
+- If `youtube-mcp` is invoked directly (e.g., via `npx`), it starts the MCP stdio server immediately — no wizard.
+- The setup wizard is opt-in via `youtube-mcp setup`.
+- Startup stderr diagnostics (already spec'd in V2.7) provide ambient awareness of configuration state.
+
+### API Key Transparency
+
+Users must understand what each key unlocks. This information appears in:
+1. The README (install section)
+2. `youtube-mcp setup` output
+3. `youtube-mcp doctor` output
+4. `checkHealth` tool response (already spec'd in V2.6)
+
+| Key | Env Variable | What It Unlocks | What Works Without It |
+|---|---|---|---|
+| **YouTube Data API v3** | `YOUTUBE_API_KEY` | Higher rate limits, video statistics (exact view/like counts), comment fetching via API, channel subscriber counts, search via API | Transcripts (yt-dlp), basic metadata (yt-dlp/page extraction), playlist expansion, semantic search, all KB operations |
+| **Gemini API** | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Higher-quality embeddings (768-dim Gemini embedding model), future visual search features | Local embeddings (TF-IDF + LSA hybrid — functional but lower semantic quality), all other features unaffected |
+| **yt-dlp** | N/A (binary on PATH) | Transcript fetching, metadata extraction, video download, fallback for API failures | Page extraction only (limited, lower quality). **Strongly recommended.** |
+
+**Key principle:** The server is fully functional with zero API keys and yt-dlp installed. API keys improve quality and unlock additional data sources but are never required for core value.
+
+### Diagnostics / Doctor Flow
+
+**`youtube-mcp doctor`** — a comprehensive diagnostic command that validates the entire stack and reports actionable issues.
+
+```
+$ youtube-mcp doctor
+
+🩺 YouTube MCP Server — Doctor
+
+Version: 0.3.0
+Platform: darwin (arm64)
+Node.js: v22.3.0
+
+Dependencies:
+  ✅ yt-dlp: v2025.01.15 (/opt/homebrew/bin/yt-dlp)
+  ❌ ffmpeg: not found (needed for future Visual Search module)
+
+API Keys:
+  ✅ YOUTUBE_API_KEY: configured
+  ⚠️  GEMINI_API_KEY: not set
+     → Using local embeddings. Set GEMINI_API_KEY for higher-quality semantic search.
+
+Data Directory:
+  ✅ Path: ~/Library/Application Support/youtube-mcp
+  ✅ Writable: yes
+  ✅ Knowledge base: 3 collections, 847 chunks, 2.1 MB
+
+MCP Client Configs:
+  ✅ Claude Desktop: configured (youtube-mcp entry found)
+  ⚠️  Claude Code: not configured
+     → Run: youtube-mcp setup
+  ❌ Cursor: not installed
+
+Connectivity:
+  ✅ YouTube API: reachable (200 OK, quota: 9,847/10,000)
+  ✅ yt-dlp: can fetch metadata (tested with jNQXAC9IVRw)
+
+Active Collection: stanford-cs229 (45 videos, 2,341 chunks)
+
+Issues Found: 1
+  ⚠️  GEMINI_API_KEY not set — local embeddings are functional but lower quality.
+     Suggestion: export GEMINI_API_KEY=your-key-here
+
+Overall: ✅ Healthy (1 non-critical warning)
+```
+
+**Doctor vs checkHealth:**
+- `youtube-mcp doctor` is a CLI command for humans. It's verbose, colorized, and runs active connectivity tests.
+- `checkHealth` is an MCP tool for LLMs. It's structured JSON, fast (< 500ms), and does NOT make network calls by default.
+- They share underlying diagnostic logic but have different output formats and verbosity levels.
+
+**Diagnostic checks performed by `doctor`:**
+
+| Check | Method | Severity if failed |
+|---|---|---|
+| Node.js version | `process.version` ≥ 20 | Error |
+| yt-dlp presence | `which yt-dlp` | Warning (degraded but functional) |
+| yt-dlp version | `yt-dlp --version` | Info |
+| ffmpeg presence | `which ffmpeg` | Info (only needed for future Visual Search) |
+| YouTube API key | `process.env.YOUTUBE_API_KEY` presence | Info (optional) |
+| YouTube API reachability | Light API call (videos.list with quota-cheap params) | Warning (if key configured but unreachable) |
+| Gemini API key | `process.env.GEMINI_API_KEY` / `GOOGLE_API_KEY` | Info (optional) |
+| Data directory | `fs.accessSync(dir, W_OK)` | Error |
+| Knowledge base integrity | Open DB, check tables exist, run `PRAGMA integrity_check` | Error |
+| MCP client configs | Scan known config paths, check for youtube-mcp entry | Info |
+| Active collection | Check if one is set | Info |
+
+### Shipped Tonight vs Future Packaging Automation
+
+**Shipped tonight (V2 build scope):**
+
+| Item | Status | Notes |
+|---|---|---|
+| `youtube-mcp doctor` CLI command | **✅ Shipped** | Local stack validation + `--json` + `--live` flags. Reports runtime, keys, detected clients, key transparency. |
+| `checkSystemHealth` MCP tool | **✅ Shipped** | Structured JSON with runtime, keys, detected clients, diagnostic checks. |
+| Startup stderr diagnostics | **✅ Shipped** | Brief diagnostic block on server start (version, data dir, keys, detected clients). Suppress via `YOUTUBE_MCP_STARTUP_DIAGNOSTICS=0`. |
+| Cross-platform `defaultDataDir` | **✅ Shipped** | macOS/Windows/Linux paths resolved via knowledge-base constructor. |
+| `package.json` `bin` entry for CLI | **✅ Shipped** | `"youtube-mcp": "dist/cli.js"` — `npx youtube-mcp` works. |
+| README install section with key transparency table | **✅ Shipped** | Documents what each key unlocks and what works without it. |
+| Client detection scaffolding | **✅ Shipped** | `detectKnownClients()` in `install-diagnostics.ts` detects Claude Desktop, Claude Code, Cursor, VS Code, ChatGPT Desktop, Codex. Surfaced in doctor and checkSystemHealth. |
+| CLI subcommands (doctor, version, serve, setup preview, help) | **✅ Shipped** | Full argument parsing in `cli.ts`. Setup prints preview with detected clients + "not automated yet" note. |
+| Key transparency in code | **✅ Shipped** | `keyTransparencySummary()` function exported + used in doctor output. |
+
+**Architecture/roadmap (NOT shipped tonight):**
+
+| Item | Status | Notes |
+|---|---|---|
+| `youtube-mcp setup` wizard (auto-config) | **Roadmap** | Client detection shipped; auto-config writing (JSON merge into client configs) is not. |
+| Auto-config writing (merge into client JSON) | **Roadmap** | Careful JSON merge logic needed — don't clobber existing config. |
+| `--auto` non-interactive setup | **Roadmap** | After interactive version is proven. |
+| npm publish to registry | **Roadmap** | Package is ready structurally (`bin`, `files`, `main` all set). Publish after V2 build is stable. |
+| Docker image | **Roadmap** | For SSE deployment. Not needed for stdio/desktop MCP. |
+| Homebrew formula | **Roadmap** | Nice-to-have for macOS users. |
+
+### CLI Subcommand Surface (After V2.15)
+
+The `youtube-mcp` CLI gains these subcommands:
+
+```
+youtube-mcp              # Start MCP stdio server (default, no subcommand needed)
+youtube-mcp serve        # Explicit: start MCP stdio server
+youtube-mcp setup        # [Roadmap] Interactive client setup wizard
+youtube-mcp setup --auto # [Roadmap] Non-interactive auto-configure
+youtube-mcp doctor       # [Tonight] Diagnostic checks
+youtube-mcp version      # Print version and exit
+```
+
+**CLI architecture note:** Tonight's build adds `doctor` and `version` as argument-parsed subcommands in `cli.ts`. The `setup` wizard is designed but not built — the CLI entrypoint should handle `setup` as an unknown-command gracefully (print "coming soon" or similar).
+
+### Implementation Readiness Checklist (V2.15 — Packaging)
+
+- [x] `youtube-mcp doctor` CLI subcommand with local diagnostic checks
+- [x] `youtube-mcp version` CLI subcommand
+- [x] CLI argument parsing in `cli.ts` (detect `doctor`, `version`, `serve`, `setup`, `help` vs default stdio)
+- [x] README install section with API key transparency table
+- [x] README quick-start with `npx youtube-mcp` and client config examples
+- [x] Startup stderr diagnostics enhanced with key transparency hints
+- [x] `checkSystemHealth` includes runtime info, key status, and detected clients
+- [x] `cli.ts` handles unknown subcommands gracefully (`setup` → preview with "not automated yet" note)
+- [x] Client detection scaffolding (`detectKnownClients()` with tests)
+- [x] `keyTransparencySummary()` utility exported and used in doctor
+
+---
+
+## V2.16) Updated Full Implementation Readiness Checklist (V2 Complete)
+
+Consolidated checklist for tonight's V2 coding run, combining V2.8, V2.14, and V2.15:
+
+### Phase 1: Foundation
+- [x] Cross-platform `defaultDataDir()` (macOS/Windows/Linux)
+- [x] Startup stderr diagnostics (version, data dir, yt-dlp, API keys, embedding provider, detected clients)
+- [x] CLI argument parsing: `doctor`, `version`, `serve`, `setup`, `help`, default=stdio
+- [ ] Schema migration — `chunk_type TEXT DEFAULT 'transcript'` on `transcript_chunks`, `PRAGMA user_version` gating (deferred — not needed for tonight's shipped surface)
+- [ ] `userFriendlyMessage` on `GracefulError` (deferred)
+
+### Phase 2: Active Collection
+- [x] `setActiveCollection` tool
+- [x] `clearActiveCollection` tool
+- [x] Active collection scoping in `searchTranscripts` (auto-scopes to active when `collectionId` omitted)
+- [x] Active collection auto-set on import (`importPlaylist`, `importVideos`)
+- [x] `scope` meta in search output (`mode`, `activeCollectionId`, `searchedCollectionIds`)
+- [x] `isActive` flag and `activeCollectionId` in `listCollections` output
+- [x] Active collection cleared on `removeCollection` when applicable
+
+### Phase 3: Diagnostics & Packaging
+- [x] `checkSystemHealth` MCP tool (runtime, keys, detected clients, diagnostic checks, suggestions)
+- [x] `checkImportReadiness` tool (transcript preflight/diagnostics)
+- [x] `youtube-mcp doctor` CLI command (local stack validation, key transparency, detected clients)
+- [x] `youtube-mcp doctor --json` and `youtube-mcp doctor --live` flags
+- [x] `youtube-mcp version` CLI command
+- [x] Client detection scaffolding (`detectKnownClients()` — Claude Desktop, Claude Code, Cursor, VS Code, ChatGPT Desktop, Codex)
+- [x] Key transparency utility (`keyTransparencySummary()`)
+- [x] `youtube-mcp setup` preview command (shows detected clients, not automated yet)
+
+### Phase 4: Quality Gates
+- [x] Sparse transcript hardening — single-chunk fallback instead of import failure
+- [ ] `minTranscriptQuality` parameter on import tools (deferred)
+- [ ] `qualityReport` in import outputs (deferred)
+
+### Phase 5: Dossier
+- [x] `buildVideoDossier` tool with metadata + transcript readiness + comments + sentiment + provenance
+
+### Phase 6: Comment KB
+- [ ] `indexComments` parameter on import tools (deferred — practical bridge shipped via dossier)
+- [ ] Comment chunk storage (`chunk_type = 'comment'`) (deferred)
+- [ ] `chunkTypes` filter on `searchTranscripts` (deferred)
+- [ ] `searchComments` tool (deferred)
+
+### Phase 7: Download Module Extension
+- [ ] `listDownloads` tool + `downloaded_assets` table schema (deferred — future media module)
+- [ ] Asset tracking in `downloadVideo` output (deferred)
+
+### Phase 8: Registration & Testing
+- [x] Register all new tools in `mcp-server.ts` (24 tools total)
+- [x] `executeTool` cases for all new tools
+- [x] Tests: active collection lifecycle, sparse transcript, import readiness, dossier, system health, client detection (14 tests passing)
+- [x] README update: install section, key transparency table, module matrix, CLI commands, quick-start path
+
+### NOT Tonight (Architecture/Roadmap Only)
+- [ ] `youtube-mcp setup` wizard (auto-config writing into client JSON)
+- [ ] Interactive/non-interactive client detection and config writing
+- [ ] npm publish to registry
+- [ ] Docker image
+- [ ] Homebrew formula
+- [ ] Visual/scene search module (V3)
+- [ ] Competitive Intel module (V3)
+- [ ] Media download module
+
+---
+---
+
+# Discovery / Trends — Capability Family
+
+**Added:** 2026-03-15
+**Status:** Design-ready specification
+**Context:** Rajan clarified the product framing: Discovery/Trends is a first-class capability family, not a single tool. Niche trend analysis is the hero use case. The product must feel full-featured and workable — not aspirational vaporware.
+
+---
+
+## DT.1) Capability Family Overview
+
+**Discovery / Trends** is the module that answers: **"What's happening in my niche right now, and what should I do about it?"**
+
+This is not a dashboard. It's an intelligence surface that a creator, researcher, or brand builder invokes through their MCP client to get actionable trend intelligence from YouTube — scoped to their specific niche, not YouTube-wide trending pages.
+
+### Why This Is a Capability Family (Not a Single Tool)
+
+A single `watchTopicTrends` tool (already shipped in V1) answers a narrow question: "Is this topic trending up, flat, or down?" That's a data point, not a capability.
+
+The **Discovery / Trends family** combines multiple signals into a coherent picture:
+
+| Signal | What It Tells You | Source |
+|---|---|---|
+| **Publishing velocity** | Are more creators covering this topic? | YouTube Search (sorted by date) |
+| **View momentum** | Are recent videos on this topic getting outsized attention? | Video stats (views, engagement) |
+| **Creator concentration** | Is this niche dominated by 2-3 channels, or fragmented? | Channel analysis across search results |
+| **Content saturation** | Is there so much content that new entries struggle? | Upload density vs engagement trends |
+| **Audience demand signals** | What are viewers asking for that nobody's making? | Comment mining, search suggestion patterns |
+| **Format gaps** | Is everyone making long-form but nobody's doing Shorts on this? | Format distribution analysis |
+
+No single tool delivers all of this. The capability family orchestrates multiple data pulls into a unified trend intelligence output.
+
+### Hero Use Case: "Find What's Trending in My Niche Right Now"
+
+**The user says:** "What's trending in AI coding assistants on YouTube right now?"
+
+**What the product delivers:**
+1. **Momentum snapshot** — This topic is accelerating. 47% more uploads in the last 30 days vs prior 30. Median views per video up 23%.
+2. **Leading content** — Top 5 recent videos getting outsized traction (with view counts, engagement rates, and channel info).
+3. **Creator landscape** — 3 dominant channels covering this consistently. 8 new entrants in the last 60 days. Fragmentation is increasing.
+4. **Saturation assessment** — Moderate saturation. Long-form reviews are crowded. Tutorial/walkthrough format is underserved.
+5. **Content gap opportunities** — Audience comments across top videos show demand for: head-to-head comparisons, pricing breakdowns, and "which one for beginners" content. These angles have low coverage relative to demand.
+6. **Actionable recommendation** — "The comparison/head-to-head angle is the clearest gap. Recent audience demand is high, coverage is low, and the format works well as both Shorts (highlights) and long-form (full breakdown)."
+
+This is the difference between a tool and a capability. The tool says "trending up." The capability says "here's what to make, and why."
+
+---
+
+## DT.2) Broad Trends vs Niche Trends — The Critical Distinction
+
+YouTube's public "Trending" page shows platform-wide viral content — music videos, celebrity drama, breaking news. That's **broad trend analysis.** It's nearly useless for creators because:
+- It's dominated by massive channels with millions of subscribers.
+- Topics are ephemeral (trending for 24-48 hours, then gone).
+- There's no niche signal — a trending Mr. Beast video tells a coding tutorial creator nothing.
+
+**Niche trend analysis** is fundamentally different:
+
+| Dimension | Broad Trends | Niche Trends |
+|---|---|---|
+| **Scope** | Platform-wide, all categories | Specific topic/vertical (e.g., "Rust programming", "home espresso") |
+| **Timeframe** | 24-48 hour spike | 30-90 day momentum arc |
+| **Signal** | Absolute view counts | Relative momentum (this niche vs its own baseline) |
+| **Audience** | General public | Niche community with specific interests |
+| **Actionability** | Low (too late, too broad) | High (informs next video, validates niche bets) |
+| **Data source** | YouTube Trending API | Search-based sampling + statistical analysis |
+
+**This product does niche trend analysis.** We do not replicate YouTube's trending page. We answer a different, more valuable question.
+
+---
+
+## DT.3) How Discovery / Trends Relates to Other Capabilities
+
+Discovery / Trends is not isolated. It connects to and builds on several existing modules:
+
+### Competitors
+- `benchmarkChannels` (V3 Competitive Intel) compares specific channels you already know about.
+- Discovery / Trends **finds** the channels and content you should be watching — it's the upstream discovery that feeds competitor analysis.
+- Flow: Discovery identifies rising creators → user feeds them into benchmarkChannels for deep comparison.
+
+### Momentum
+- `mapGrowthTrajectory` (V3) tracks a single channel's growth over time.
+- Discovery / Trends tracks **topic-level momentum** — the aggregate signal across all channels publishing on a topic.
+- A topic can have strong momentum even if individual channels are flat (many new entrants, each small but collectively significant).
+
+### Saturation
+- No existing tool measures saturation. Discovery / Trends introduces this concept.
+- Saturation = high publishing velocity + declining per-video engagement. It means the niche is getting crowded.
+- This is the "should I still enter this space?" signal that creators desperately need and currently guess at.
+
+### Content Gaps
+- `findContentGaps` (V2 Creator Intel) analyzes a **single channel's** coverage vs its niche.
+- Discovery / Trends finds **niche-level gaps** — topics the entire creator ecosystem is underserving.
+- These are complementary: niche-level gaps tell you what to make; channel-level gaps tell you what you specifically are missing.
+
+---
+
+## DT.4) Data Source Limitations — What Is Actually Buildable
+
+**This section is deliberately honest.** The goal is a product that works, not one that promises magic.
+
+### What YouTube Actually Gives Us
+
+| Data Point | Source | Reliability | Notes |
+|---|---|---|---|
+| **Recent videos on a topic** | Search API / yt-dlp search | ✅ High | Can filter by date, sort by relevance or view count |
+| **Video view counts** | API / yt-dlp metadata | ✅ High | Snapshot at time of query (not historical time series) |
+| **Video engagement (likes, comments)** | API (likes) / yt-dlp (partial) | ⚠️ Medium | Comment counts need API key; likes sometimes hidden |
+| **Channel metadata** | API / yt-dlp / page extraction | ✅ High | Subscriber count, total videos, creation date |
+| **Upload dates** | API / yt-dlp | ✅ High | Can calculate publishing velocity from this |
+| **Video tags** | API only | ⚠️ Medium | Many creators don't use tags; API key required |
+| **Comments text** | API only | ⚠️ Medium | Requires API key; rate-limited; sample only |
+| **Search suggestions** | Page extraction / autocomplete | ⚠️ Medium | Can infer demand from what YouTube suggests |
+| **Video duration/format** | API / yt-dlp | ✅ High | Can distinguish Shorts vs long-form |
+
+### What YouTube Does NOT Give Us
+
+| Data Point | Why Not | Implication |
+|---|---|---|
+| **Historical view counts** | YouTube doesn't expose time-series view data via API | We see a snapshot, not a growth curve. We approximate velocity by comparing recent vs older videos. |
+| **Impression/CTR data** | Only available in YouTube Studio for your own channel | We cannot directly measure how many people *saw* a video vs clicked it. |
+| **Watch time / retention** | Only available in YouTube Studio | We infer engagement quality from like/comment ratios, not from actual retention curves. |
+| **YouTube's internal trending signals** | Proprietary algorithm | We build our own trend detection from observable public data. |
+| **Subscriber demographics** | Private | We cannot segment by age, location, or interests beyond what's in public comments. |
+| **Monetization data** | Private | We cannot estimate CPM/RPM for a niche directly. |
+
+### What This Means for the Product
+
+1. **Trend detection is statistical, not omniscient.** We sample recent videos, measure their observable metrics, and compute momentum from the distribution. This is genuinely useful but has confidence bounds.
+2. **View velocity is approximated.** We compare view counts of videos published 7 days ago vs 30 days ago vs 90 days ago. This reveals momentum patterns but not daily trajectories.
+3. **Saturation assessment is directional.** We can detect "many uploads, declining median engagement" — that's a strong saturation signal. But we can't see impressions, so true saturation (high supply, low click-through) is partially obscured.
+4. **Content gap detection is comment-driven.** The strongest demand signals come from what people are asking for in comments. This requires an API key and is limited to sampled comments.
+5. **All outputs include confidence scores.** We never present approximations as facts. Every trend assessment carries a confidence level and a note on what data was available.
+
+### Buildability Assessment
+
+| Feature | Buildable Now? | Confidence | Key Dependency |
+|---|---|---|---|
+| Publishing velocity in a niche | ✅ Yes | High | YouTube Search (API or yt-dlp) |
+| View momentum (relative) | ✅ Yes | Medium-High | Video stats across time cohorts |
+| Creator landscape mapping | ✅ Yes | High | Search + channel metadata |
+| Saturation assessment | ✅ Yes | Medium | Velocity + engagement correlation |
+| Audience demand signals | ⚠️ Partial | Medium | Comments (API key required) + search suggestions |
+| Format gap detection | ✅ Yes | High | Duration/format metadata |
+| Content gap identification | ⚠️ Partial | Medium | Comments + transcript analysis across collection |
+| Actionable recommendations | ✅ Yes | Medium | Synthesis of above signals |
+
+**Bottom line:** The core of niche trend analysis — momentum, saturation, creator landscape, format gaps — is buildable right now with high confidence. Demand-side signals (what the audience wants) are partially available and improve significantly with an API key for comment access.
+
+---
+
+## DT.5) Tool Specification — Discovery / Trends
+
+### Tool: `analyzeNicheTrends` (Hero Tool)
+
+The primary entry point for niche trend analysis. One call, full picture.
+
+```ts
+export interface AnalyzeNicheTrendsInput extends TokenControls {
+  niche: string; // e.g., "AI coding assistants", "home espresso", "Rust programming"
+  nicheKeywords?: string[]; // additional search terms to broaden/refine the niche signal
+  regionCode?: string; // ISO country code
+  lookbackDays?: number; // default 90
+  sampleSize?: number; // max videos to analyze, default 50, max 100
+  includeGaps?: boolean; // default true — requires more API calls, benefits from API key
+  includeCreatorMap?: boolean; // default true
+}
+
+export interface AnalyzeNicheTrendsOutput {
+  niche: string;
+  analyzedAt: string; // ISO-8601
+  sampleSize: number;
+
+  momentum: {
+    direction: "accelerating" | "growing" | "stable" | "slowing" | "declining";
+    confidence: number; // 0..1
+    publishingVelocity: {
+      last30d: number; // videos/day
+      prior30d: number; // videos/day
+      changePercent: number;
+    };
+    viewMomentum: {
+      medianViewsLast30d?: number;
+      medianViewsPrior30d?: number;
+      changePercent?: number;
+    };
+    engagementMomentum: {
+      medianEngagementRateLast30d?: number;
+      medianEngagementRatePrior30d?: number;
+      changePercent?: number;
+    };
+    summary: string; // Human-readable: "This niche is accelerating — 47% more uploads, 23% higher median views"
+  };
+
+  saturation: {
+    level: "low" | "moderate" | "high" | "oversaturated";
+    confidence: number; // 0..1
+    signals: {
+      uploadDensity: "sparse" | "moderate" | "dense" | "flooded";
+      engagementTrend: "improving" | "stable" | "declining";
+      newEntrantRate: number; // new channels publishing on this topic in lookback period
+    };
+    summary: string; // "Moderate saturation — upload density is rising but engagement is holding steady"
+  };
+
+  creatorLandscape?: {
+    totalActiveCreators: number; // channels with uploads in lookback period
+    dominantCreators: Array<{
+      channelId: string;
+      channelTitle: string;
+      handle?: string;
+      uploadsInPeriod: number;
+      medianViews?: number;
+      estimatedNicheSharePct: number; // share of total views in this niche sample
+    }>;
+    risingCreators: Array<{
+      channelId: string;
+      channelTitle: string;
+      handle?: string;
+      recentUploads: number;
+      avgViewsPerVideo?: number;
+      signal: string; // "New entrant with above-median engagement"
+    }>;
+    concentration: {
+      top3SharePct: number; // combined niche share of top 3 channels
+      fragmentationLevel: "concentrated" | "moderate" | "fragmented";
+    };
+  };
+
+  contentGaps?: {
+    formatGaps: Array<{
+      format: "short" | "long" | "tutorial" | "review" | "comparison" | "reaction" | "case_study" | "news";
+      currentCoveragePct: number; // what % of recent videos use this format
+      demandSignal: "low" | "medium" | "high"; // inferred from engagement rates of this format
+      opportunity: string; // "Tutorials get 2.3x the engagement of reviews but are only 12% of uploads"
+    }>;
+    topicGaps?: Array<{
+      subtopic: string;
+      demandEvidence: string; // "Mentioned in 23% of comments across top videos"
+      currentCoverage: "none" | "sparse" | "moderate" | "well_covered";
+      opportunityScore: number; // 0..100
+    }>;
+    audienceQuestions?: string[]; // Top unanswered questions from comment mining (requires API key)
+  };
+
+  leadingContent: Array<{
+    videoId: string;
+    title: string;
+    channelTitle: string;
+    publishedAt?: string;
+    views?: number;
+    engagementRate?: number;
+    format: "short" | "long" | "unknown";
+    whyLeading: string; // "Outsized views relative to channel size — 4.2x channel average"
+  }>;
+
+  recommendation: {
+    topOpportunity: string; // "Head-to-head comparison content is the clearest gap"
+    suggestedAngles: string[];
+    timing: string; // "Niche momentum is strong — good time to enter"
+    risks: string[]; // "Saturation is moderate — differentiation matters"
+  };
+
+  dataQuality: {
+    apiKeyUsed: boolean;
+    commentDataAvailable: boolean;
+    sampleCoverage: string; // "Analyzed 50 of estimated 200+ recent videos"
+    limitationsApplied: string[]; // "View velocity approximated from publish-date cohorts", etc.
+  };
+
+  provenance: Provenance;
+}
+```
+
+**Tool description:** `"Analyze what's trending in a specific YouTube niche right now. Returns momentum, saturation, creator landscape, content gaps, and actionable recommendations. This is niche-level intelligence — not YouTube's broad trending page."`
+
+### Tool: `watchTopicTrends` (Existing — Repositioned)
+
+The existing `watchTopicTrends` (V1) remains as a **lightweight, fast** trend check. It's the quick pulse — "is this topic up, flat, or down?" — without the full niche analysis.
+
+**Relationship:** `watchTopicTrends` is the scout. `analyzeNicheTrends` is the full intelligence briefing. A creator might use `watchTopicTrends` daily to monitor 5 topics, then use `analyzeNicheTrends` weekly on the one that's moving.
+
+### Tool: `compareNiches`
+
+Compare two or more niches side-by-side to decide where to focus.
+
+```ts
+export interface CompareNichesInput extends TokenControls {
+  niches: Array<{
+    name: string;
+    keywords?: string[];
+  }>; // 2..5 niches
+  regionCode?: string;
+  lookbackDays?: number; // default 90
+  samplePerNiche?: number; // default 30
+}
+
+export interface CompareNichesOutput {
+  niches: Array<{
+    name: string;
+    momentum: AnalyzeNicheTrendsOutput["momentum"];
+    saturation: AnalyzeNicheTrendsOutput["saturation"];
+    sampleSize: number;
+  }>;
+  comparison: {
+    bestMomentum: string; // niche name
+    lowestSaturation: string; // niche name
+    bestOpportunity: string; // niche name — composite score
+    rationale: string;
+  };
+  provenance: Provenance;
+}
+```
+
+**Tool description:** `"Compare 2-5 niches side by side on momentum, saturation, and opportunity. Use to decide which niche to focus on or validate a niche bet."`
+
+### Tool: `trackNicheOverTime`
+
+Designed for repeated invocation — build a trend history by running weekly/monthly.
+
+```ts
+export interface TrackNicheOverTimeInput extends TokenControls {
+  niche: string;
+  nicheKeywords?: string[];
+  regionCode?: string;
+  snapshotId?: string; // if provided, compares against a previous snapshot
+}
+
+export interface TrackNicheOverTimeOutput {
+  niche: string;
+  snapshotId: string; // persist this to compare later
+  snapshotAt: string; // ISO-8601
+  current: {
+    publishingVelocity: number; // videos/day
+    medianViews?: number;
+    medianEngagementRate?: number;
+    activeCreators: number;
+    saturationLevel: "low" | "moderate" | "high" | "oversaturated";
+  };
+  comparison?: {
+    previousSnapshotId: string;
+    previousSnapshotAt: string;
+    velocityChange: number; // percent
+    viewsChange?: number; // percent
+    engagementChange?: number; // percent
+    creatorCountChange: number;
+    saturationShift: string; // "stable" | "increasing" | "decreasing"
+    narrative: string; // "Since your last check 14 days ago, this niche has..."
+  };
+  provenance: Provenance;
+}
+```
+
+**Tool description:** `"Take a snapshot of a niche's current state. Optionally compare against a previous snapshot to track changes over time. Use weekly or monthly for trend monitoring."`
+
+---
+
+## DT.6) Implementation Strategy
+
+### What's Buildable Now (V2.5 Scope)
+
+| Tool | Complexity | Dependencies | Build Order |
+|---|---|---|---|
+| `analyzeNicheTrends` (hero) | Medium-High | Search + video stats + channel metadata + (optional) comments | First — this is the hero |
+| `watchTopicTrends` | Already shipped | — | Repositioned, no changes needed |
+| `compareNiches` | Medium | Wraps `analyzeNicheTrends` logic | Second — reuses hero tool internals |
+| `trackNicheOverTime` | Low-Medium | Snapshot persistence (add table to SQLite) | Third — lightweight |
+
+### Data Pipeline for `analyzeNicheTrends`
+
+```
+1. Search YouTube for niche keywords (sorted by date, last N days)
+   → Get video IDs + basic metadata
+   
+2. Fetch stats for sampled videos (fallback chain applies)
+   → View counts, like counts, comment counts, durations, publish dates
+   
+3. Group videos into time cohorts (last 30d, 30-60d, 60-90d)
+   → Calculate per-cohort medians for views, engagement, publishing velocity
+   
+4. Extract unique channels from results
+   → Calculate per-channel contribution, identify dominant vs rising creators
+   
+5. Compute saturation signals
+   → Cross-correlate upload density with engagement trends
+   
+6. [If API key + includeGaps] Sample comments from top videos
+   → Mine for recurring questions, complaints, requests
+   
+7. Analyze format distribution
+   → Count Shorts vs long-form, correlate format with engagement
+   
+8. Synthesize recommendation
+   → Combine momentum + saturation + gaps into actionable guidance
+```
+
+### Schema Addition
+
+```sql
+-- For trackNicheOverTime snapshot persistence
+CREATE TABLE IF NOT EXISTS niche_snapshots (
+  snapshot_id TEXT PRIMARY KEY,
+  niche TEXT NOT NULL,
+  keywords TEXT, -- JSON array
+  region_code TEXT,
+  snapshot_at TEXT NOT NULL, -- ISO-8601
+  data TEXT NOT NULL, -- JSON blob of snapshot metrics
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_niche_snapshots_niche ON niche_snapshots(niche, snapshot_at);
+```
+
+---
+
+## DT.7) Updated Module Map Entry
+
+**Add to the Module Map table in V2.12:**
+
+| Module | Scope | Default? | Dependencies Beyond Core | Status |
+|---|---|---|---|---|
+| **Discovery / Trends** | Niche trend analysis, momentum, saturation, creator landscape, content gaps, niche comparison, trend tracking | Always on | Comments need API key for demand signals; core analysis works without | **V2.5 — design ready, build next** |
+
+**Module Capability Matrix addition:**
+
+| Module | Needs API Key? | Needs yt-dlp? | Needs ffmpeg? | Needs Vision Model? | Disk Impact | Token Cost |
+|---|---|---|---|---|---|---|
+| Discovery / Trends | Optional (better demand signals with) | Recommended (search fallback) | No | No | ~1MB (snapshots) | Medium-High (multi-search aggregation) |
+
+---
+
+## DT.8) Tool Catalog Update
+
+After Discovery / Trends, add to V2.10 tool summary:
+
+| Tool | Category | Version | Status |
+|---|---|---|---|
+| `analyzeNicheTrends` | **Discovery / Trends** | V2.5 | **New — hero tool** |
+| `compareNiches` | **Discovery / Trends** | V2.5 | **New** |
+| `trackNicheOverTime` | **Discovery / Trends** | V2.5 | **New** |
+| `watchTopicTrends` | **Discovery / Trends** | V1 | Shipped (repositioned from Core) |
+
+**Total tool count: 28** (25 existing + 3 new Discovery / Trends tools)
+
+---
+
+## DT.9) Risks and Mitigations (Discovery / Trends)
+
+### Risk: Search-based sampling introduces bias
+**Mitigation:** YouTube search results are ranked by relevance/recency, not random. We acknowledge this in `dataQuality.limitationsApplied`. Sample size is configurable (up to 100). Multiple keyword variations broaden coverage.
+
+### Risk: View counts are snapshots, not trajectories
+**Mitigation:** We compare cohorts (last 30d vs prior 30d) rather than tracking individual videos over time. This gives directional momentum without requiring repeated polling. `trackNicheOverTime` builds history through repeated snapshots.
+
+### Risk: Saturation assessment without impression data is approximate
+**Mitigation:** We use upload density × engagement trend as a proxy. Declining engagement + rising uploads is a strong saturation signal even without impression data. Confidence scores reflect this limitation.
+
+### Risk: Content gap detection is weak without API key (no comments)
+**Mitigation:** Format gap analysis works without API key (based on video metadata). Topic gaps and audience questions require comment sampling (API key). `dataQuality.commentDataAvailable` tells the user exactly what they're missing.
+
+### Risk: "Niche" is ambiguous — user might pass too broad or too narrow a topic
+**Mitigation:** `nicheKeywords` lets users refine. `dataQuality.sampleCoverage` tells them how much of the niche they captured. If sample is too small (< 10 videos in lookback), we emit a warning suggesting broader keywords.
+
+### Risk: Token cost is higher than single-tool calls (multi-search aggregation)
+**Mitigation:** Default sample size of 50 balances cost vs coverage. `compact: true` by default. `includeGaps` and `includeCreatorMap` can be disabled for faster, cheaper runs.
+
+---
+
+## DT.10) Implementation Readiness Checklist (Discovery / Trends)
+
+- [ ] `analyzeNicheTrends` tool — full implementation with momentum, saturation, creator landscape, gaps, recommendation
+- [ ] `compareNiches` tool — wraps analyzeNicheTrends internals for side-by-side comparison
+- [ ] `trackNicheOverTime` tool — snapshot persistence + comparison logic
+- [ ] `niche_snapshots` SQLite table + migration
+- [ ] `watchTopicTrends` repositioned in module map (no code change needed)
+- [ ] Register all 3 new tools in `mcp-server.ts`
+- [ ] `checkHealth` / `checkSystemHealth` updated to include Discovery / Trends module status
+- [ ] Tests: niche trend analysis with mock search data, saturation calculation, cohort comparison
+- [ ] README update: Discovery / Trends section with hero use case example
+---
+
+## V2.17) Discovery / Trends Module — Shipped
+
+### Module Name
+**Discovery / Trends**
+
+### Hero Use Case
+**"Find what's trending in my niche right now."**
+
+### Tools
+
+#### `discoverNicheTrends`
+Given a niche/topic string, runs two YouTube search passes (recent by date + top by viewCount) to build a multi-signal view:
+- **Momentum** — splits results by recency, compares median views → accelerating / steady / decelerating
+- **Saturation** — view concentration ratio (top-third share) → low / medium / high
+- **Content gaps** — heuristic scan for under-represented formats/angles (Shorts gap, tutorial gap, comparison content gap, data-driven gap)
+- **Format breakdown** — Shorts vs long-form vs unknown percentage
+- **Recurring keywords** — title/tag frequency analysis
+- Returns explicit `limitations[]` array — no claims about YouTube internal data
+
+#### `exploreNicheCompetitors`
+Given a niche/topic string:
+- Searches YouTube for top results, groups by channel
+- Ranks channels by peak video views in the niche
+- Per-channel: sampled video count, median views, median engagement, top video
+- Landscape summary: total channels, median views, top performer
+- Honest limitations about search-based discovery
+
+### Data Sources
+- **Primary:** YouTube Data API v3 search (when `YOUTUBE_API_KEY` configured)
+- **Fallback:** yt-dlp search (when no API key)
+- **Enrichment:** `inspectVideo` for tags, engagement rates, view velocity
+
+### What It CAN Do
+- Trend momentum detection (accelerating / decelerating / steady)
+- Saturation analysis (crowded vs open niches)
+- Content gap identification (format and topic gaps)
+- Format breakdown (Shorts vs long-form distribution)
+- Competitor channel landscape mapping
+
+### What It CANNOT Do (Honestly)
+- Access YouTube's internal trending/explore feed (not in public API)
+- Get impression data, CTR, or watch time (creator-only analytics, requires OAuth)
+- Measure true search volume (would need Google Trends API)
+- Guarantee comprehensive niche coverage (limited to search result sampling)
+- Track trends over time (no persistence layer yet — V3 candidate)
+
+### Dependencies
+- None beyond core (yt-dlp recommended)
+- Better results with `YOUTUBE_API_KEY` (view counts, tags, engagement stats)
+
+### Analysis Functions (in `analysis.ts`)
+- `computeNicheMomentum()` — recent-vs-older view ratio, 4+ video minimum
+- `computeNicheSaturation()` — concentration-ratio-based scoring
+- `detectContentGaps()` — heuristic gap detection with opportunity scoring
+- `computeFormatBreakdown()` — Shorts/long/unknown percentage computation
+
+### Tests
+- 12 new tests in `trends-discovery.test.ts`
+- Covers: momentum (insufficient data, accelerating, decelerating, steady), saturation (insufficient, high, low), content gaps (shorts, tutorial, well-covered), format breakdown
+
+---
+
+## V2.18) Media Asset Module — Shipped
+
+### Module Name
+**Media / Assets**
+
+### Purpose
+Moves youtube-mcp beyond transcript-only by supporting local storage and management of downloaded media files. Foundation layer for future visual search.
+
+### Tools
+
+#### `downloadAsset`
+Download video/audio/thumbnail via yt-dlp. Returns manifest entry with file path and metadata. Deduplicates — returns cached asset if already exists.
+
+#### `listMediaAssets`
+List stored assets, filtered by video ID and/or kind (video/audio/thumbnail/keyframe). Includes store-wide stats.
+
+#### `removeMediaAsset`
+Remove specific asset or all assets for a video. Optionally deletes files from disk.
+
+#### `extractKeyframes`
+Extract keyframe images from a downloaded video at configurable intervals using ffmpeg. Requires video downloaded first.
+
+#### `mediaStoreHealth`
+Health check: disk usage, asset counts, ffmpeg/yt-dlp binary availability and versions.
+
+### Architecture
+- **Separate SQLite database** — `~/.youtube-mcp/media/media-manifest.db`
+- **`MediaStore`** — SQLite-backed asset manifest (register, list, query, remove)
+- **`MediaDownloader`** — yt-dlp wrapper with deduplication
+- **`ThumbnailExtractor`** — ffmpeg keyframe extraction at configurable intervals
+- **File organization:** `~/.youtube-mcp/media/files/{videoId}/` with predictable naming
+
+### What It Does NOT Do
+- No visual search or classification — produces raw image files only
+- No video format conversion
+- No automatic cleanup/retention policy
+- No progress streaming for large downloads
+- No batch download (single video per call)
+
+### Dependencies
+- `yt-dlp` (required for downloads)
+- `ffmpeg` (required for keyframe extraction)
+- No new npm dependencies
+
+### Tests
+- 9 unit tests in `media-store.test.ts`
+- Covers: register/retrieve, list, filter, stats, remove, summary, mime guessing, metadata
+
+---
+
+## V2.19) Comment Knowledge Base Module — Shipped
+
+### Module Name
+**Comment KB**
+
+### Purpose
+Parallel knowledge base for comments — index, store, and semantically search YouTube comments alongside (but separate from) transcript search.
+
+### Tools
+
+#### `importComments`
+Fetch + index a video's comments into a searchable collection. Reuses existing `readComments` pipeline (YouTube API → yt-dlp fallback). Re-importing replaces old index cleanly.
+
+#### `searchComments`
+Semantic search over indexed comments with ranked results. Supports `videoIdFilter` for multi-video collections. Like-count boost (capped at 10%) surfaces community-validated insights.
+
+#### `listCommentCollections`
+List comment collections with video/chunk counts.
+
+#### `setActiveCommentCollection`
+Set default collection scope for comment search.
+
+#### `clearActiveCommentCollection`
+Clear active collection (search fans out to all collections).
+
+#### `removeCommentCollection`
+Delete a comment collection and its index.
+
+### Architecture
+- **Separate tables** in shared `knowledge-base.sqlite` database
+- Tables: `comment_collections`, `comment_collection_videos`, `comment_chunks`, `comment_collection_models`, `comment_app_state`
+- **Source separation:** Transcript KB and comment KB are independent — different tables, different active collection state, different search paths
+- **Same TF-IDF + LSA hybrid search** as transcript KB
+- **Like-count boost:** High-engagement comments get up to 10% relevance boost
+- **Reply tracking:** `isReply` flag and `parentAuthor` for thread context
+- **Comment filtering:** Short/empty comments (<5 chars or <2 tokens) excluded
+
+### What It Does NOT Do
+- No playlist-level comment import (single video only)
+- No Gemini embedding support (uses local LSA only — portable from transcript KB)
+- No combined transcript+comment search (intentionally separate for cleaner relevance)
+- No comment sentiment enrichment in search results
+
+### Dependencies
+- None beyond core
+- Comments require `YOUTUBE_API_KEY` for reliable fetching
+
+### Tests
+- 6 tests in `comment-knowledge-base.test.ts`
+- Covers: full lifecycle, active collection management, short comment filtering, video replacement, ID generation, search with video filter
+
+---
+
+## V2.20) v0.3.0 Implementation Summary
+
+### What Shipped
+- **37 MCP tools** (was 24 in v0.2.16)
+- **15,724 lines** of TypeScript
+- **50 tests** passing (was 22)
+- **3 new modules:** Discovery/Trends, Media/Assets, Comment KB
+
+### New Tool Inventory (13 new tools)
+
+| # | Tool | Module |
+|---|---|---|
+| 25 | `discoverNicheTrends` | Discovery / Trends |
+| 26 | `exploreNicheCompetitors` | Discovery / Trends |
+| 27 | `downloadAsset` | Media / Assets |
+| 28 | `listMediaAssets` | Media / Assets |
+| 29 | `removeMediaAsset` | Media / Assets |
+| 30 | `extractKeyframes` | Media / Assets |
+| 31 | `mediaStoreHealth` | Media / Assets |
+| 32 | `importComments` | Comment KB |
+| 33 | `searchComments` | Comment KB |
+| 34 | `listCommentCollections` | Comment KB |
+| 35 | `setActiveCommentCollection` | Comment KB |
+| 36 | `clearActiveCommentCollection` | Comment KB |
+| 37 | `removeCommentCollection` | Comment KB |

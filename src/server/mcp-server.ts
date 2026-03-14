@@ -8,6 +8,10 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { YouTubeService } from "../lib/youtube-service.js";
+import { MediaStore } from "../lib/media-store.js";
+import { MediaDownloader } from "../lib/media-downloader.js";
+import { ThumbnailExtractor } from "../lib/thumbnail-extractor.js";
+import { parseVideoId } from "../lib/id-parsing.js";
 
 export const tools: Tool[] = [
   {
@@ -186,6 +190,159 @@ export const tools: Tool[] = [
     },
   },
   {
+    name: "importPlaylist",
+    description: "Import a playlist into the local transcript knowledge base for semantic search in Claude Desktop.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        playlistUrlOrId: { type: "string" },
+        collectionId: { type: "string" },
+        maxVideos: { type: "number", minimum: 1, maximum: 200 },
+        chunkStrategy: { type: "string", enum: ["time_window", "chapters", "auto"] },
+        chunkSizeSec: { type: "number", minimum: 30, maximum: 900 },
+        chunkOverlapSec: { type: "number", minimum: 0, maximum: 300 },
+        language: { type: "string" },
+        reindexExisting: { type: "boolean" },
+        label: { type: "string" },
+        embeddingProvider: { type: "string", enum: ["local", "gemini"] },
+        embeddingModel: { type: "string" },
+        embeddingDimensions: { type: "number", minimum: 128, maximum: 3072 },
+        activateCollection: { type: "boolean" },
+        dryRun: { type: "boolean" },
+      },
+      required: ["playlistUrlOrId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "importVideos",
+    description: "Import one or more videos into a local transcript collection for later semantic search.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        videoIdsOrUrls: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 50 },
+        collectionId: { type: "string" },
+        chunkStrategy: { type: "string", enum: ["time_window", "chapters", "auto"] },
+        chunkSizeSec: { type: "number", minimum: 30, maximum: 900 },
+        chunkOverlapSec: { type: "number", minimum: 0, maximum: 300 },
+        language: { type: "string" },
+        reindexExisting: { type: "boolean" },
+        label: { type: "string" },
+        embeddingProvider: { type: "string", enum: ["local", "gemini"] },
+        embeddingModel: { type: "string" },
+        embeddingDimensions: { type: "number", minimum: 128, maximum: 3072 },
+        activateCollection: { type: "boolean" },
+        dryRun: { type: "boolean" },
+      },
+      required: ["videoIdsOrUrls"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "searchTranscripts",
+    description: "Search imported transcript-text collections with active-collection focus by default and return ranked timestamped chunks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        collectionId: { type: "string" },
+        maxResults: { type: "number", minimum: 1, maximum: 50 },
+        minScore: { type: "number", minimum: 0, maximum: 1 },
+        videoIdFilter: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 100 },
+        useActiveCollection: { type: "boolean" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "listCollections",
+    description: "List local transcript collections, active search focus, and indexed video/chunk counts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        includeVideoList: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "setActiveCollection",
+    description: "Set the default collection that transcript search should focus on when collectionId is omitted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        collectionId: { type: "string" },
+      },
+      required: ["collectionId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "clearActiveCollection",
+    description: "Clear the active collection so transcript search fans back out across all collections.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "checkImportReadiness",
+    description: "Diagnose whether a video is importable tonight, including transcript availability, sparse-transcript warnings, and yt-dlp/API issues.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        videoIdOrUrl: { type: "string" },
+        language: { type: "string" },
+        dryRun: { type: "boolean" },
+      },
+      required: ["videoIdOrUrl"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "buildVideoDossier",
+    description: "Build a one-shot video dossier with core metadata/transcript readiness, optionally extended with comments, sentiment, and provenance.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        videoIdOrUrl: { type: "string" },
+        commentSampleSize: { type: "number", minimum: 1, maximum: 50 },
+        includeComments: { type: "boolean" },
+        includeSentiment: { type: "boolean" },
+        includeTranscriptSummary: { type: "boolean" },
+        dryRun: { type: "boolean" },
+      },
+      required: ["videoIdOrUrl"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "checkSystemHealth",
+    description: "Check setup and provider health for Claude Desktop tonight: yt-dlp, YouTube API, Gemini embeddings, and local storage.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        runLiveChecks: { type: "boolean" },
+        dryRun: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "removeCollection",
+    description: "Delete a local transcript collection and its search index.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        collectionId: { type: "string" },
+      },
+      required: ["collectionId"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "scoreHookPatterns",
     description: "Heuristically score first-30-second hooks across one or more videos.",
     inputSchema: {
@@ -244,13 +401,209 @@ export const tools: Tool[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "discoverNicheTrends",
+    description:
+      "Discover what's trending in a niche right now. Returns top-performing and recent videos, momentum signals (accelerating/steady/decelerating), saturation analysis, content gap opportunities, keyword patterns, and format breakdown. Grounded in YouTube search data with honest limitations disclosed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        niche: {
+          type: "string",
+          description: "The niche or topic to explore, e.g. 'AI coding tools', 'home espresso', 'Kubernetes tutorials'",
+        },
+        regionCode: { type: "string", description: "ISO 3166-1 alpha-2 country code, e.g. US, AU, DE" },
+        maxResults: { type: "number", minimum: 5, maximum: 25 },
+        lookbackDays: { type: "number", minimum: 7, maximum: 365 },
+        dryRun: { type: "boolean" },
+      },
+      required: ["niche"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "exploreNicheCompetitors",
+    description:
+      "Discover active channels in a niche by analyzing who ranks in YouTube search results. Returns channel-level stats, top videos, and a landscape summary. Useful for competitive reconnaissance before entering a niche.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        niche: {
+          type: "string",
+          description: "The niche or topic to explore, e.g. 'home lab networking', 'meal prep for beginners'",
+        },
+        regionCode: { type: "string", description: "ISO 3166-1 alpha-2 country code" },
+        maxChannels: { type: "number", minimum: 3, maximum: 20 },
+        dryRun: { type: "boolean" },
+      },
+      required: ["niche"],
+      additionalProperties: false,
+    },
+  },
+  // ── Media / Asset tools ──────────────────────────────────────
+  {
+    name: "downloadAsset",
+    description: "Download a YouTube video, audio track, or thumbnail to local storage. Returns asset manifest entry with file path. Does NOT perform visual indexing — this is honest file storage.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        videoIdOrUrl: { type: "string", description: "YouTube video ID or URL" },
+        format: {
+          type: "string",
+          enum: ["best_video", "best_audio", "thumbnail", "worst_video"],
+          description: "What to download. best_video = highest quality video+audio, best_audio = audio only, thumbnail = YouTube thumbnail image, worst_video = smallest video for previews",
+        },
+        maxSizeMb: { type: "number", minimum: 1, maximum: 5000, description: "Max download size in MB (default 500)" },
+      },
+      required: ["videoIdOrUrl", "format"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "listMediaAssets",
+    description: "List locally stored media assets. Filter by video or kind. Shows file paths, sizes, and manifest metadata.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        videoIdOrUrl: { type: "string", description: "Filter to assets for this video" },
+        kind: { type: "string", enum: ["video", "audio", "thumbnail", "keyframe"], description: "Filter by asset kind" },
+        limit: { type: "number", minimum: 1, maximum: 500 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "removeMediaAsset",
+    description: "Remove stored media assets. Specify assetId to remove one, or videoIdOrUrl to remove all assets for a video.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        assetId: { type: "string", description: "Specific asset ID to remove" },
+        videoIdOrUrl: { type: "string", description: "Remove all assets for this video" },
+        deleteFiles: { type: "boolean", description: "Also delete files from disk (default true)" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "extractKeyframes",
+    description: "Extract keyframe images from a locally downloaded video at regular intervals using ffmpeg. Requires the video to be downloaded first via downloadAsset. Does NOT do visual search or classification — produces raw frame images.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        videoIdOrUrl: { type: "string", description: "Video ID or URL (must have a local video asset)" },
+        intervalSec: { type: "number", minimum: 1, maximum: 3600, description: "Extract one frame every N seconds (default 30)" },
+        maxFrames: { type: "number", minimum: 1, maximum: 100, description: "Maximum frames to extract (default 20)" },
+        imageFormat: { type: "string", enum: ["jpg", "png", "webp"], description: "Output image format (default jpg)" },
+        width: { type: "number", minimum: 160, maximum: 3840, description: "Image width in pixels, height auto-scaled (default 640)" },
+      },
+      required: ["videoIdOrUrl"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mediaStoreHealth",
+    description: "Check health of the local media store: disk usage, asset counts, ffmpeg/yt-dlp availability.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  // ── Comment Knowledge Base Tools ──
+  {
+    name: "importComments",
+    description: "Import a video's comments into the local comment knowledge base for semantic search. Fetches comments via the existing comment pipeline and indexes them for searchComments.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        videoIdOrUrl: { type: "string", description: "YouTube video URL or ID" },
+        collectionId: { type: "string", description: "Custom collection ID (default: comments-{videoId})" },
+        maxTopLevel: { type: "number", minimum: 1, maximum: 200, description: "Max top-level comments to fetch" },
+        includeReplies: { type: "boolean", description: "Include reply threads (default: true)" },
+        maxRepliesPerThread: { type: "number", minimum: 0, maximum: 20 },
+        order: { type: "string", enum: ["relevance", "time"] },
+        label: { type: "string", description: "Human-readable collection label" },
+        activateCollection: { type: "boolean", description: "Set as active comment collection (default: true)" },
+        dryRun: { type: "boolean" },
+      },
+      required: ["videoIdOrUrl"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "searchComments",
+    description: "Search imported comment collections with ranked results. Returns matching comments with author, like count, and relevance score. Uses active comment collection by default.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query" },
+        collectionId: { type: "string", description: "Specific collection to search" },
+        maxResults: { type: "number", minimum: 1, maximum: 50 },
+        minScore: { type: "number", minimum: 0, maximum: 1 },
+        videoIdFilter: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 100 },
+        useActiveCollection: { type: "boolean" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "listCommentCollections",
+    description: "List local comment collections, active search focus, and indexed comment counts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        includeVideoList: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "setActiveCommentCollection",
+    description: "Set the default comment collection that searchComments should focus on when collectionId is omitted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        collectionId: { type: "string" },
+      },
+      required: ["collectionId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "clearActiveCommentCollection",
+    description: "Clear the active comment collection so comment search fans back out across all comment collections.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "removeCommentCollection",
+    description: "Delete a local comment collection and its search index.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        collectionId: { type: "string" },
+      },
+      required: ["collectionId"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 export function createYouTubeMcpServer(service = new YouTubeService()): Server {
+  // Initialize media subsystem (lazy — created once on first server start)
+  const mediaStore = new MediaStore();
+  const mediaDownloader = new MediaDownloader(mediaStore);
+  const thumbnailExtractor = new ThumbnailExtractor(mediaStore);
+
   const server = new Server(
     {
       name: "youtube-mcp",
-      version: "0.2.0",
+      version: "0.3.0",
     },
     {
       capabilities: {
@@ -266,7 +619,10 @@ export function createYouTubeMcpServer(service = new YouTubeService()): Server {
     const dryRun = readBoolean(args, "dryRun", false);
 
     try {
-      const result = await executeTool(service, request.params.name, args, dryRun);
+      const result = await executeTool(
+        service, request.params.name, args, dryRun,
+        mediaStore, mediaDownloader, thumbnailExtractor,
+      );
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
@@ -293,6 +649,9 @@ async function executeTool(
   toolName: string,
   args: Record<string, unknown>,
   dryRun: boolean,
+  mediaStore?: MediaStore,
+  mediaDownloader?: MediaDownloader,
+  thumbnailExtractor?: ThumbnailExtractor,
 ): Promise<unknown> {
   switch (toolName) {
     case "findVideos":
@@ -416,6 +775,102 @@ async function executeTool(
         { dryRun },
       );
 
+    case "importPlaylist":
+      return service.importPlaylist(
+        {
+          playlistUrlOrId: readString(args, "playlistUrlOrId"),
+          collectionId: optionalString(args, "collectionId"),
+          maxVideos: optionalNumber(args, "maxVideos"),
+          chunkStrategy: optionalEnum(args, "chunkStrategy", ["time_window", "chapters", "auto"]),
+          chunkSizeSec: optionalNumber(args, "chunkSizeSec"),
+          chunkOverlapSec: optionalNumber(args, "chunkOverlapSec"),
+          language: optionalString(args, "language"),
+          reindexExisting: optionalBoolean(args, "reindexExisting"),
+          label: optionalString(args, "label"),
+          embeddingProvider: optionalEnum(args, "embeddingProvider", ["local", "gemini"]),
+          embeddingModel: optionalString(args, "embeddingModel"),
+          embeddingDimensions: optionalNumber(args, "embeddingDimensions"),
+          activateCollection: optionalBoolean(args, "activateCollection"),
+        },
+        { dryRun },
+      );
+
+    case "importVideos":
+      return service.importVideos(
+        {
+          videoIdsOrUrls: readStringArray(args, "videoIdsOrUrls"),
+          collectionId: optionalString(args, "collectionId"),
+          chunkStrategy: optionalEnum(args, "chunkStrategy", ["time_window", "chapters", "auto"]),
+          chunkSizeSec: optionalNumber(args, "chunkSizeSec"),
+          chunkOverlapSec: optionalNumber(args, "chunkOverlapSec"),
+          language: optionalString(args, "language"),
+          reindexExisting: optionalBoolean(args, "reindexExisting"),
+          label: optionalString(args, "label"),
+          embeddingProvider: optionalEnum(args, "embeddingProvider", ["local", "gemini"]),
+          embeddingModel: optionalString(args, "embeddingModel"),
+          embeddingDimensions: optionalNumber(args, "embeddingDimensions"),
+          activateCollection: optionalBoolean(args, "activateCollection"),
+        },
+        { dryRun },
+      );
+
+    case "searchTranscripts":
+      return service.searchTranscripts({
+        query: readString(args, "query"),
+        collectionId: optionalString(args, "collectionId"),
+        maxResults: optionalNumber(args, "maxResults"),
+        minScore: optionalNumber(args, "minScore"),
+        videoIdFilter: optionalStringArray(args, "videoIdFilter"),
+        useActiveCollection: optionalBoolean(args, "useActiveCollection"),
+      });
+
+    case "listCollections":
+      return service.listCollections({
+        includeVideoList: optionalBoolean(args, "includeVideoList"),
+      });
+
+    case "setActiveCollection":
+      return service.setActiveCollection({
+        collectionId: readString(args, "collectionId"),
+      });
+
+    case "clearActiveCollection":
+      return service.clearActiveCollection();
+
+    case "checkImportReadiness":
+      return service.checkImportReadiness(
+        {
+          videoIdOrUrl: readString(args, "videoIdOrUrl"),
+          language: optionalString(args, "language"),
+        },
+        { dryRun },
+      );
+
+    case "buildVideoDossier":
+      return service.buildVideoDossier(
+        {
+          videoIdOrUrl: readString(args, "videoIdOrUrl"),
+          commentSampleSize: optionalNumber(args, "commentSampleSize"),
+          includeComments: optionalBoolean(args, "includeComments"),
+          includeSentiment: optionalBoolean(args, "includeSentiment"),
+          includeTranscriptSummary: optionalBoolean(args, "includeTranscriptSummary"),
+        },
+        { dryRun },
+      );
+
+    case "checkSystemHealth":
+      return service.checkSystemHealth(
+        {
+          runLiveChecks: optionalBoolean(args, "runLiveChecks"),
+        },
+        { dryRun },
+      );
+
+    case "removeCollection":
+      return service.removeCollection({
+        collectionId: readString(args, "collectionId"),
+      });
+
     case "scoreHookPatterns":
       return service.scoreHookPatterns(
         {
@@ -445,6 +900,50 @@ async function executeTool(
         { dryRun },
       );
 
+    // ── Comment Knowledge Base ──
+    case "importComments":
+      return service.importComments(
+        {
+          videoIdOrUrl: readString(args, "videoIdOrUrl"),
+          collectionId: optionalString(args, "collectionId"),
+          maxTopLevel: optionalNumber(args, "maxTopLevel"),
+          includeReplies: optionalBoolean(args, "includeReplies"),
+          maxRepliesPerThread: optionalNumber(args, "maxRepliesPerThread"),
+          order: optionalEnum(args, "order", ["relevance", "time"]),
+          label: optionalString(args, "label"),
+          activateCollection: optionalBoolean(args, "activateCollection"),
+        },
+        { dryRun },
+      );
+
+    case "searchComments":
+      return service.searchComments({
+        query: readString(args, "query"),
+        collectionId: optionalString(args, "collectionId"),
+        maxResults: optionalNumber(args, "maxResults"),
+        minScore: optionalNumber(args, "minScore"),
+        videoIdFilter: optionalStringArray(args, "videoIdFilter"),
+        useActiveCollection: optionalBoolean(args, "useActiveCollection"),
+      });
+
+    case "listCommentCollections":
+      return service.listCommentCollections({
+        includeVideoList: optionalBoolean(args, "includeVideoList"),
+      });
+
+    case "setActiveCommentCollection":
+      return service.setActiveCommentCollection({
+        collectionId: readString(args, "collectionId"),
+      });
+
+    case "clearActiveCommentCollection":
+      return service.clearActiveCommentCollection();
+
+    case "removeCommentCollection":
+      return service.removeCommentCollection({
+        collectionId: readString(args, "collectionId"),
+      });
+
     case "recommendUploadWindows":
       return service.recommendUploadWindows(
         {
@@ -454,6 +953,198 @@ async function executeTool(
         },
         { dryRun },
       );
+
+    case "discoverNicheTrends":
+      return service.discoverNicheTrends(
+        {
+          niche: readString(args, "niche"),
+          regionCode: optionalString(args, "regionCode"),
+          maxResults: optionalNumber(args, "maxResults"),
+          lookbackDays: optionalNumber(args, "lookbackDays"),
+        },
+        { dryRun },
+      );
+
+    case "exploreNicheCompetitors":
+      return service.exploreNicheCompetitors(
+        {
+          niche: readString(args, "niche"),
+          regionCode: optionalString(args, "regionCode"),
+          maxChannels: optionalNumber(args, "maxChannels"),
+        },
+        { dryRun },
+      );
+
+    // ── Media / Asset tools ──────────────────────────────────
+    case "downloadAsset": {
+      if (!mediaStore || !mediaDownloader) throw new Error("Media subsystem not initialized");
+      const videoIdOrUrl = readString(args, "videoIdOrUrl");
+      const format = readString(args, "format") as "best_video" | "best_audio" | "thumbnail" | "worst_video";
+      const maxSizeMb = optionalNumber(args, "maxSizeMb");
+      const result = await mediaDownloader.download({ videoIdOrUrl, format, maxSizeMb });
+      const provenance = { sourceTier: "yt_dlp" as const, fetchedAt: new Date().toISOString(), fallbackDepth: 0 as const, partial: false };
+      return {
+        asset: {
+          assetId: result.asset.assetId,
+          videoId: result.asset.videoId,
+          kind: result.asset.kind,
+          filePath: result.asset.filePath,
+          fileName: result.asset.fileName,
+          fileSizeBytes: result.asset.fileSizeBytes,
+          mimeType: result.asset.mimeType,
+          durationSec: result.asset.durationSec,
+          width: result.asset.width,
+          height: result.asset.height,
+        },
+        downloadedBytes: result.downloadedBytes,
+        durationMs: result.durationMs,
+        cached: result.downloadedBytes === 0,
+        provenance,
+      };
+    }
+
+    case "listMediaAssets": {
+      if (!mediaStore) throw new Error("Media subsystem not initialized");
+      const videoIdOrUrl = optionalString(args, "videoIdOrUrl");
+      const kind = optionalString(args, "kind") as "video" | "audio" | "thumbnail" | "keyframe" | undefined;
+      const limit = optionalNumber(args, "limit");
+
+      let assets;
+      if (videoIdOrUrl) {
+        const videoId = parseVideoId(videoIdOrUrl) ?? videoIdOrUrl;
+        assets = mediaStore.listAssetsForVideo(videoId);
+        if (kind) assets = assets.filter((a) => a.kind === kind);
+        if (limit) assets = assets.slice(0, limit);
+      } else {
+        assets = mediaStore.listAllAssets({ kind: kind as any, limit });
+      }
+
+      const stats = mediaStore.getStats();
+      const provenance = { sourceTier: "none" as const, fetchedAt: new Date().toISOString(), fallbackDepth: 0 as const, partial: false };
+      return {
+        assets: assets.map((a) => ({
+          assetId: a.assetId,
+          videoId: a.videoId,
+          kind: a.kind,
+          filePath: a.filePath,
+          fileName: a.fileName,
+          fileSizeBytes: a.fileSizeBytes,
+          mimeType: a.mimeType,
+          timestampSec: a.timestampSec,
+          width: a.width,
+          height: a.height,
+          durationSec: a.durationSec,
+          createdAt: a.createdAt,
+        })),
+        stats: {
+          totalAssets: stats.totalAssets,
+          totalSizeBytes: stats.totalSizeBytes,
+          videoCount: stats.videoCount,
+          byKind: stats.byKind,
+        },
+        provenance,
+      };
+    }
+
+    case "removeMediaAsset": {
+      if (!mediaStore) throw new Error("Media subsystem not initialized");
+      const assetId = optionalString(args, "assetId");
+      const videoIdOrUrl = optionalString(args, "videoIdOrUrl");
+      const deleteFiles = readBoolean(args, "deleteFiles", true);
+
+      if (!assetId && !videoIdOrUrl) {
+        throw new Error("Provide either assetId or videoIdOrUrl to specify what to remove");
+      }
+
+      let removed = 0;
+      let freedBytes = 0;
+
+      if (assetId) {
+        const asset = mediaStore.getAsset(assetId);
+        if (asset) {
+          freedBytes = asset.fileSizeBytes;
+          mediaStore.removeAsset(assetId, deleteFiles);
+          removed = 1;
+        }
+      } else if (videoIdOrUrl) {
+        const videoId = parseVideoId(videoIdOrUrl) ?? videoIdOrUrl;
+        const assets = mediaStore.listAssetsForVideo(videoId);
+        freedBytes = assets.reduce((sum, a) => sum + a.fileSizeBytes, 0);
+        removed = mediaStore.removeVideoAssets(videoId, deleteFiles);
+      }
+
+      const provenance = { sourceTier: "none" as const, fetchedAt: new Date().toISOString(), fallbackDepth: 0 as const, partial: false };
+      return { removed, freedBytes, provenance };
+    }
+
+    case "extractKeyframes": {
+      if (!mediaStore || !thumbnailExtractor) throw new Error("Media subsystem not initialized");
+      const videoIdOrUrl = readString(args, "videoIdOrUrl");
+      const videoId = parseVideoId(videoIdOrUrl) ?? videoIdOrUrl;
+      const result = await thumbnailExtractor.extractKeyframes({
+        videoId,
+        intervalSec: optionalNumber(args, "intervalSec"),
+        maxFrames: optionalNumber(args, "maxFrames"),
+        imageFormat: optionalEnum(args, "imageFormat", ["jpg", "png", "webp"]),
+        width: optionalNumber(args, "width"),
+      });
+      const provenance = { sourceTier: "none" as const, fetchedAt: new Date().toISOString(), fallbackDepth: 0 as const, partial: false, sourceNotes: ["Extracted locally via ffmpeg"] };
+      return {
+        videoId: result.videoId,
+        framesExtracted: result.framesExtracted,
+        assets: result.assets.map((a) => ({
+          assetId: a.assetId,
+          filePath: a.filePath,
+          timestampSec: a.timestampSec ?? 0,
+          width: a.width,
+          height: a.height,
+          fileSizeBytes: a.fileSizeBytes,
+        })),
+        durationMs: result.durationMs,
+        provenance,
+      };
+    }
+
+    case "mediaStoreHealth": {
+      if (!mediaStore) throw new Error("Media subsystem not initialized");
+      const stats = mediaStore.getStats();
+      let ffmpegAvailable = false;
+      let ffmpegVersion: string | undefined;
+      let ytdlpAvailable = false;
+      let ytdlpVersion: string | undefined;
+
+      if (thumbnailExtractor) {
+        try {
+          const probeResult = await thumbnailExtractor.probe();
+          ffmpegAvailable = true;
+          ffmpegVersion = probeResult.ffmpeg;
+        } catch { /* unavailable */ }
+      }
+      if (mediaDownloader) {
+        try {
+          const probeResult = await mediaDownloader.probe();
+          ytdlpAvailable = true;
+          ytdlpVersion = probeResult.version;
+        } catch { /* unavailable */ }
+      }
+
+      const provenance = { sourceTier: "none" as const, fetchedAt: new Date().toISOString(), fallbackDepth: 0 as const, partial: false };
+      return {
+        dataDir: mediaStore.dataDir,
+        assetsDir: mediaStore.assetsDir,
+        stats: {
+          totalAssets: stats.totalAssets,
+          totalSizeBytes: stats.totalSizeBytes,
+          videoCount: stats.videoCount,
+          byKind: stats.byKind,
+        },
+        ffmpegAvailable,
+        ffmpegVersion,
+        ytdlpAvailable,
+        ytdlpVersion,
+        provenance,
+      };
+    }
 
     default:
       throw new Error(`Unknown tool: ${toolName}`);
@@ -505,6 +1196,15 @@ function optionalBoolean(args: Record<string, unknown>, key: string): boolean | 
 
 function readStringArray(args: Record<string, unknown>, key: string): string[] {
   const value = args[key];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`Argument '${key}' must be an array of strings`);
+  }
+  return value as string[];
+}
+
+function optionalStringArray(args: Record<string, unknown>, key: string): string[] | undefined {
+  const value = args[key];
+  if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     throw new Error(`Argument '${key}' must be an array of strings`);
   }

@@ -1,11 +1,17 @@
+import { writeFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 import {
   average,
   buildChapterTranscriptSegments,
   buildTranscriptSegmentsForWindow,
   computeCommentRate,
   computeEngagementRate,
+  computeFormatBreakdown,
   computeLikeRate,
+  computeNicheMomentum,
+  computeNicheSaturation,
   computeViewVelocity24h,
+  detectContentGaps,
   extractRecurringKeywords,
   inferVideoFormat,
   median,
@@ -16,6 +22,13 @@ import {
   titleStructure,
   analyzeComments,
 } from "./analysis.js";
+import { CommentKnowledgeBase } from "./comment-knowledge-base.js";
+import { createEmbeddingProvider, resolveEmbeddingSelection } from "./embedding-provider.js";
+import { detectKnownClients, readPackageMetadata } from "./install-diagnostics.js";
+import { TranscriptKnowledgeBase } from "./knowledge-base.js";
+import { MediaStore } from "./media-store.js";
+import { MediaDownloader } from "./media-downloader.js";
+import { ThumbnailExtractor } from "./thumbnail-extractor.js";
 import {
   parseChannelRef,
   parsePlaylistId,
@@ -29,24 +42,55 @@ import type {
   AnalyzeVideoSetInput,
   AnalyzeVideoSetItem,
   AnalyzeVideoSetOutput,
+  BuildVideoDossierInput,
+  BuildVideoDossierOutput,
   ChannelRecord,
+  CheckImportReadinessInput,
+  CheckImportReadinessOutput,
+  CheckSystemHealthInput,
+  CheckSystemHealthOutput,
+  ClearActiveCollectionOutput,
+  ClearActiveCommentCollectionOutput,
+  ClientDetectionSummary,
   CommentRecord,
   CompareShortsVsLongInput,
   CompareShortsVsLongOutput,
+  DiagnosticCheck,
+  DiscoverNicheTrendsInput,
+  DiscoverNicheTrendsOutput,
+  DownloadAssetInput,
+  DownloadAssetOutput,
   ExpandPlaylistInput,
   ExpandPlaylistOutput,
+  ExploreNicheCompetitorsInput,
+  ExploreNicheCompetitorsOutput,
+  ExtractKeyframesInput,
+  ExtractKeyframesOutput,
   FindVideosInput,
   FindVideosOutput,
   GracefulError,
+  ImportCommentsInput,
+  ImportCommentsOutput,
+  ImportPlaylistOutput,
+  ImportVideosOutput,
   InspectChannelInput,
   InspectChannelOutput,
   InspectVideoInput,
   InspectVideoOutput,
   ListChannelCatalogInput,
   ListChannelCatalogOutput,
+  ListCollectionsInput,
+  ListCollectionsOutput,
+  ListCommentCollectionsInput,
+  ListCommentCollectionsOutput,
+  ListMediaAssetsInput,
+  ListMediaAssetsOutput,
   MeasureAudienceSentimentInput,
   MeasureAudienceSentimentOutput,
+  MediaStoreHealthOutput,
+  NicheCompetitor,
   Pagination,
+  PlaylistKnowledgeBaseInput,
   Provenance,
   ReadCommentsInput,
   ReadCommentsOutput,
@@ -54,14 +98,30 @@ import type {
   ReadTranscriptOutput,
   RecommendUploadWindowsInput,
   RecommendUploadWindowsOutput,
+  RemoveCollectionInput,
+  RemoveCollectionOutput,
+  RemoveCommentCollectionInput,
+  RemoveCommentCollectionOutput,
+  RemoveMediaAssetInput,
+  RemoveMediaAssetOutput,
   ResearchTagsAndTitlesInput,
   ResearchTagsAndTitlesOutput,
   ScoreHookPatternsInput,
   ScoreHookPatternsOutput,
+  SearchCommentsInput,
+  SearchCommentsOutput,
+  SearchTranscriptsInput,
+  SearchTranscriptsOutput,
   ServiceOptions,
+  SetActiveCollectionInput,
+  SetActiveCollectionOutput,
+  SetActiveCommentCollectionInput,
+  SetActiveCommentCollectionOutput,
   SourceTier,
   TranscriptRecord,
+  TrendingVideo,
   VideoAnalysisMode,
+  VideoKnowledgeBaseInput,
   VideoRecord,
 } from "./types.js";
 import { YouTubeApiClient } from "./youtube-api-client.js";
@@ -71,6 +131,7 @@ interface YouTubeServiceConfig {
   apiKey?: string;
   dryRun?: boolean;
   ytDlpBinary?: string;
+  dataDir?: string;
 }
 
 class ToolExecutionError extends Error {
@@ -94,12 +155,22 @@ export class YouTubeService {
   private readonly ytdlp: YtDlpClient;
   private readonly pageExtract: PageExtractClient;
   private readonly dryRun: boolean;
+  private readonly knowledgeBase: TranscriptKnowledgeBase;
+  private readonly commentKnowledgeBase: CommentKnowledgeBase;
+  private readonly mediaStore: MediaStore;
+  private readonly mediaDownloader: MediaDownloader;
+  private readonly thumbnailExtractor: ThumbnailExtractor;
 
   constructor(config: YouTubeServiceConfig = {}) {
     this.api = new YouTubeApiClient({ apiKey: config.apiKey ?? process.env.YOUTUBE_API_KEY });
     this.ytdlp = new YtDlpClient(config.ytDlpBinary);
     this.pageExtract = new PageExtractClient();
     this.dryRun = Boolean(config.dryRun);
+    this.knowledgeBase = new TranscriptKnowledgeBase({ dataDir: config.dataDir });
+    this.commentKnowledgeBase = new CommentKnowledgeBase({ dataDir: config.dataDir });
+    this.mediaStore = new MediaStore({ dataDir: config.dataDir });
+    this.mediaDownloader = new MediaDownloader(this.mediaStore, config.ytDlpBinary);
+    this.thumbnailExtractor = new ThumbnailExtractor(this.mediaStore);
   }
 
   async findVideos(input: FindVideosInput, options: ServiceOptions = {}): Promise<FindVideosOutput> {
@@ -594,6 +665,669 @@ export class YouTubeService {
     };
   }
 
+  async importPlaylist(input: PlaylistKnowledgeBaseInput, options: ServiceOptions = {}): Promise<ImportPlaylistOutput> {
+    const embeddingSelection = resolveEmbeddingSelection(input);
+    const maxVideos = clamp(input.maxVideos ?? 50, 1, 200);
+    const playlist = await this.expandPlaylist(
+      {
+        playlistUrlOrId: input.playlistUrlOrId,
+        maxVideos,
+        includeVideoMeta: true,
+      },
+      options,
+    );
+    const collectionId = input.collectionId ?? `playlist-${playlist.playlist.playlistId}`;
+    this.knowledgeBase.ensureCollection({
+      collectionId,
+      label: input.label,
+      sourceType: "playlist",
+      sourceRef: playlist.playlist.playlistId,
+      sourceTitle: playlist.playlist.title,
+      sourceChannelTitle: playlist.playlist.channelTitle,
+    });
+
+    const prepared = await this.prepareKnowledgeBaseItems(
+      playlist.videos.map((video) => video.videoId),
+      {
+        language: input.language,
+        chunkStrategy: input.chunkStrategy,
+        chunkSizeSec: input.chunkSizeSec,
+        chunkOverlapSec: input.chunkOverlapSec,
+        reindexExisting: input.reindexExisting,
+      },
+      collectionId,
+      options,
+    );
+
+    const stored = this.knowledgeBase.importPlaylist(
+      {
+        collectionId,
+        label: input.label,
+        sourceType: "playlist",
+        sourceRef: playlist.playlist.playlistId,
+        sourceTitle: playlist.playlist.title,
+        sourceChannelTitle: playlist.playlist.channelTitle,
+      },
+      playlist.playlist,
+      prepared.items,
+    );
+
+    if (stored.import.imported > 0 && embeddingSelection.kind === "gemini") {
+      await this.knowledgeBase.reindexCollectionEmbeddings(collectionId, embeddingSelection);
+    }
+
+    const activeCollectionId = input.activateCollection === false
+      ? this.knowledgeBase.getActiveCollectionId() ?? undefined
+      : this.knowledgeBase.setActiveCollection(collectionId).activeCollectionId;
+
+    return {
+      ...stored,
+      import: {
+        ...stored.import,
+        totalVideos: prepared.totalRequested,
+        skipped: stored.import.skipped + prepared.skipped,
+        failed: stored.import.failed + prepared.failures.length,
+      },
+      failures: [...(prepared.failures ?? []), ...(stored.failures ?? [])],
+      activeCollectionId,
+    };
+  }
+
+  async importVideos(input: VideoKnowledgeBaseInput, options: ServiceOptions = {}): Promise<ImportVideosOutput> {
+    if (!Array.isArray(input.videoIdsOrUrls) || input.videoIdsOrUrls.length === 0) {
+      throw this.invalidInput("videoIdsOrUrls must contain at least one video");
+    }
+
+    const embeddingSelection = resolveEmbeddingSelection(input);
+    const collectionId = input.collectionId ?? this.defaultVideoCollectionId(input);
+    const prepared = await this.prepareKnowledgeBaseItems(
+      input.videoIdsOrUrls.slice(0, 50),
+      {
+        language: input.language,
+        chunkStrategy: input.chunkStrategy,
+        chunkSizeSec: input.chunkSizeSec,
+        chunkOverlapSec: input.chunkOverlapSec,
+        reindexExisting: input.reindexExisting,
+      },
+      collectionId,
+      options,
+    );
+
+    const stored = this.knowledgeBase.importVideos(
+      {
+        collectionId,
+        label: input.label,
+        sourceType: "videos",
+      },
+      prepared.items,
+    );
+
+    if (stored.import.imported > 0 && embeddingSelection.kind === "gemini") {
+      await this.knowledgeBase.reindexCollectionEmbeddings(collectionId, embeddingSelection);
+    }
+
+    const activeCollectionId = input.activateCollection === false
+      ? this.knowledgeBase.getActiveCollectionId() ?? undefined
+      : this.knowledgeBase.setActiveCollection(collectionId).activeCollectionId;
+
+    return {
+      ...stored,
+      import: {
+        ...stored.import,
+        totalVideos: prepared.totalRequested,
+        skipped: stored.import.skipped + prepared.skipped,
+        failed: stored.import.failed + prepared.failures.length,
+      },
+      failures: [...(prepared.failures ?? []), ...(stored.failures ?? [])],
+      activeCollectionId,
+    };
+  }
+
+  async searchTranscripts(input: SearchTranscriptsInput): Promise<SearchTranscriptsOutput> {
+    const query = input.query?.trim();
+    if (!query) {
+      throw this.invalidInput("Query cannot be empty");
+    }
+
+    return this.knowledgeBase.search({
+      ...input,
+      query,
+    });
+  }
+
+  async listCollections(input: ListCollectionsInput = {}): Promise<ListCollectionsOutput> {
+    return this.knowledgeBase.listCollections(input.includeVideoList ?? false);
+  }
+
+  async setActiveCollection(input: SetActiveCollectionInput): Promise<SetActiveCollectionOutput> {
+    if (!input.collectionId?.trim()) {
+      throw this.invalidInput("collectionId cannot be empty");
+    }
+    return this.knowledgeBase.setActiveCollection(input.collectionId.trim());
+  }
+
+  async clearActiveCollection(): Promise<ClearActiveCollectionOutput> {
+    return this.knowledgeBase.clearActiveCollection();
+  }
+
+  async checkImportReadiness(
+    input: CheckImportReadinessInput,
+    options: ServiceOptions = {},
+  ): Promise<CheckImportReadinessOutput> {
+    const videoId = this.requireVideoId(input.videoIdOrUrl);
+    if (this.isDryRun(options)) {
+      return this.sampleImportReadiness(videoId);
+    }
+
+    const checks: DiagnosticCheck[] = [];
+    const suggestions: string[] = [];
+    let title: string | undefined;
+    let transcriptAvailable = false;
+    let transcriptLanguages: string[] | undefined;
+    let transcriptRecord: TranscriptRecord | undefined;
+    let metadataProvenance: Provenance | undefined;
+
+    if (this.api.isConfigured()) {
+      try {
+        const apiVideo = await this.api.getVideoInfo(videoId);
+        title = title ?? apiVideo.title;
+        transcriptAvailable ||= Boolean(apiVideo.transcriptAvailable);
+        transcriptLanguages = apiVideo.transcriptLanguages;
+        checks.push({
+          name: "youtube_api_metadata",
+          status: "ok",
+          detail: `Metadata loaded via YouTube API. Caption flag=${apiVideo.transcriptAvailable ? "true" : "false"}.`,
+        });
+        metadataProvenance = this.makeProvenance("youtube_api", false);
+      } catch (error) {
+        checks.push({
+          name: "youtube_api_metadata",
+          status: "warn",
+          detail: toMessage(error),
+        });
+        suggestions.push("If you want higher-fidelity metadata, verify YOUTUBE_API_KEY is valid && has YouTube Data API v3 enabled.");
+      }
+    } else {
+      checks.push({
+        name: "youtube_api_metadata",
+        status: "skipped",
+        detail: "YOUTUBE_API_KEY not configured. This is optional for transcript import.",
+      });
+    }
+
+    try {
+      const probe = await this.ytdlp.probe();
+      checks.push({
+        name: "yt_dlp_binary",
+        status: "ok",
+        detail: `${probe.binary} available (${probe.version}).`,
+      });
+    } catch (error) {
+      const detail = toMessage(error);
+      checks.push({
+        name: "yt_dlp_binary",
+        status: "error",
+        detail,
+      });
+      suggestions.push("Install yt-dlp && make sure GUI-launched apps can see it via PATH.");
+      return {
+        videoId,
+        title,
+        importReadiness: {
+          canImport: false,
+          status: "blocked",
+          summary: "Import is blocked because yt-dlp is unavailable.",
+          suggestedCollectionId: TranscriptKnowledgeBase.videosCollectionId({ videoIdsOrUrls: [videoId] }),
+        },
+        transcript: {
+          available: false,
+        },
+        checks,
+        suggestions,
+        provenance: metadataProvenance ?? this.makeProvenance("none", true, checks.map((check) => `${check.name}: ${check.detail}`)),
+      };
+    }
+
+    try {
+      const ytDlpVideo = await this.ytdlp.videoInfo(videoId);
+      title = title ?? ytDlpVideo.title;
+      transcriptAvailable ||= Boolean(ytDlpVideo.transcriptAvailable);
+      transcriptLanguages = transcriptLanguages ?? ytDlpVideo.transcriptLanguages;
+      checks.push({
+        name: "yt_dlp_metadata",
+        status: "ok",
+        detail: `Metadata loaded via yt-dlp. Transcript advertised=${ytDlpVideo.transcriptAvailable ? "true" : "false"}.`,
+      });
+      metadataProvenance = metadataProvenance ?? this.makeProvenance("yt_dlp", false);
+    } catch (error) {
+      checks.push({
+        name: "yt_dlp_metadata",
+        status: "warn",
+        detail: toMessage(error),
+      });
+    }
+
+    try {
+      transcriptRecord = await this.ytdlp.transcript(videoId, input.language);
+      transcriptAvailable = true;
+      const sparse = isSparseTranscript(transcriptRecord);
+      const estimatedSearchableChunks = estimateTranscriptChunks(transcriptRecord);
+      checks.push({
+        name: "yt_dlp_transcript",
+        status: sparse ? "warn" : "ok",
+        detail: sparse
+          ? `Transcript fetched but is sparse (${transcriptRecord.transcriptText.length} chars, ${transcriptRecord.segments.length} segments). Import should still work via whole-transcript fallback.`
+          : `Transcript fetched successfully (${transcriptRecord.transcriptText.length} chars, ${transcriptRecord.segments.length} segments).`,
+      });
+      if (sparse) {
+        suggestions.push("This transcript is sparse. V2 now imports it as a single searchable chunk instead of failing, but search quality may be shallow.");
+      }
+    } catch (error) {
+      const detail = toMessage(error);
+      checks.push({
+        name: "yt_dlp_transcript",
+        status: "error",
+        detail,
+      });
+      suggestions.push("Try a video with public captions or confirm the video is not region/age restricted.");
+      if (detail.toLowerCase().includes("subtitle") || detail.toLowerCase().includes("caption")) {
+        suggestions.push("If this specific video has no public subtitle track, import will stay blocked until captions are available.");
+      }
+    }
+
+    if (!title) {
+      try {
+        const pageVideo = await this.pageExtract.getVideoInfo(videoId);
+        title = pageVideo.title;
+        checks.push({
+          name: "page_extract_metadata",
+          status: "ok",
+          detail: "Public watch-page metadata extracted successfully.",
+        });
+        metadataProvenance = metadataProvenance ?? this.makeProvenance("page_extract", true);
+      } catch (error) {
+        checks.push({
+          name: "page_extract_metadata",
+          status: "warn",
+          detail: toMessage(error),
+        });
+      }
+    }
+
+    const sparseTranscript = transcriptRecord ? isSparseTranscript(transcriptRecord) : undefined;
+    const canImport = Boolean(transcriptRecord);
+    const status = !canImport
+      ? (transcriptAvailable ? "uncertain" : "blocked")
+      : sparseTranscript
+        ? "ready_sparse_transcript"
+        : "ready";
+    const summary = !canImport
+      ? (transcriptAvailable
+          ? "Metadata suggests captions may exist, but the transcript could not be fetched right now."
+          : "Transcript import is currently blocked because no usable public caption track could be fetched.")
+      : sparseTranscript
+        ? "Transcript is importable, but sparse. V2 will preserve it as a single searchable chunk."
+        : "Transcript is importable && should chunk normally for semantic search.";
+
+    if (!canImport && !this.api.isConfigured()) {
+      suggestions.push("Adding YOUTUBE_API_KEY helps metadata diagnostics, even though transcript import still depends on public captions via yt-dlp.");
+    }
+
+    return {
+      videoId,
+      title,
+      importReadiness: {
+        canImport,
+        status,
+        summary,
+        suggestedCollectionId: TranscriptKnowledgeBase.videosCollectionId({ videoIdsOrUrls: [videoId] }),
+      },
+      transcript: {
+        available: transcriptAvailable,
+        sourceType: transcriptRecord?.sourceType,
+        languageUsed: transcriptRecord?.languageUsed,
+        segmentCount: transcriptRecord?.segments.length,
+        transcriptCharacters: transcriptRecord?.transcriptText.length,
+        sparseTranscript,
+        estimatedSearchableChunks: transcriptRecord ? estimateTranscriptChunks(transcriptRecord) : undefined,
+      },
+      checks,
+      suggestions: dedupeStrings(suggestions),
+      provenance: metadataProvenance ?? this.makeProvenance("none", true, checks.map((check) => `${check.name}: ${check.detail}`)),
+    };
+  }
+
+  async buildVideoDossier(
+    input: BuildVideoDossierInput,
+    options: ServiceOptions = {},
+  ): Promise<BuildVideoDossierOutput> {
+    const includeComments = input.includeComments ?? true;
+    const includeSentiment = input.includeSentiment ?? true;
+    const includeTranscriptSummary = input.includeTranscriptSummary ?? true;
+    const commentSampleSize = clamp(input.commentSampleSize ?? 8, 1, 50);
+
+    const video = await this.inspectVideo({
+      videoIdOrUrl: input.videoIdOrUrl,
+      includeTranscriptMeta: true,
+      includeEngagementRatios: true,
+    }, options);
+    const readiness = await this.checkImportReadiness({
+      videoIdOrUrl: input.videoIdOrUrl,
+    }, options);
+
+    let transcriptSummary: string | undefined;
+    if (includeTranscriptSummary && readiness.importReadiness.canImport) {
+      try {
+        const transcript = await this.readTranscript({
+          videoIdOrUrl: input.videoIdOrUrl,
+          mode: "summary",
+        }, options);
+        transcriptSummary = transcript.transcript.text;
+      } catch {
+        transcriptSummary = undefined;
+      }
+    }
+
+    let comments: ReadCommentsOutput | undefined;
+    if (includeComments) {
+      try {
+        comments = await this.readComments({
+          videoIdOrUrl: input.videoIdOrUrl,
+          maxTopLevel: commentSampleSize,
+        }, options);
+      } catch {
+        comments = undefined;
+      }
+    }
+
+    let sentiment: MeasureAudienceSentimentOutput | undefined;
+    if (includeSentiment) {
+      try {
+        sentiment = await this.measureAudienceSentiment({
+          videoIdOrUrl: input.videoIdOrUrl,
+          sampleSize: commentSampleSize,
+        }, options);
+      } catch {
+        sentiment = undefined;
+      }
+    }
+
+    return {
+      video: video.video,
+      stats: video.stats,
+      transcript: {
+        available: readiness.transcript.available,
+        importReadiness: readiness.importReadiness,
+        languageUsed: readiness.transcript.languageUsed,
+        sourceType: readiness.transcript.sourceType,
+        summary: transcriptSummary,
+        sparseTranscript: readiness.transcript.sparseTranscript,
+      },
+      comments: comments
+        ? {
+            totalFetched: comments.totalFetched,
+            sample: comments.threads.map((thread) => ({
+              author: thread.author,
+              text: thread.text,
+              likeCount: thread.likeCount,
+              publishedAt: thread.publishedAt,
+            })),
+          }
+        : undefined,
+      audienceSentiment: sentiment?.sentiment,
+      riskSignals: sentiment?.riskSignals,
+      representativeQuotes: sentiment?.representativeQuotes,
+      suggestedCollectionId: readiness.importReadiness.suggestedCollectionId,
+      checks: readiness.checks,
+      provenance: this.mergeProvenances([
+        video.provenance,
+        readiness.provenance,
+        comments?.provenance,
+        sentiment?.provenance,
+      ].filter(Boolean) as Provenance[]),
+    };
+  }
+
+  async checkSystemHealth(input: CheckSystemHealthInput = {}, options: ServiceOptions = {}): Promise<CheckSystemHealthOutput> {
+    if (this.isDryRun(options)) {
+      return this.sampleSystemHealth();
+    }
+
+    const runLiveChecks = input.runLiveChecks ?? true;
+    const checks: DiagnosticCheck[] = [];
+    const suggestions: string[] = [];
+    const packageMeta = readPackageMetadata();
+    const clients: ClientDetectionSummary[] = detectKnownClients();
+    const youtubeApiConfigured = this.api.isConfigured();
+    const geminiConfigured = Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
+
+    try {
+      const probe = await this.ytdlp.probe();
+      checks.push({
+        name: "yt_dlp",
+        status: "ok",
+        detail: `${probe.binary} available (${probe.version}).`,
+      });
+    } catch (error) {
+      checks.push({
+        name: "yt_dlp",
+        status: "error",
+        detail: toMessage(error),
+      });
+      suggestions.push("Install yt-dlp && expose it in PATH for your MCP client runtime.");
+    }
+
+    if (youtubeApiConfigured) {
+      if (runLiveChecks) {
+        try {
+          await this.api.getVideoInfo("jNQXAC9IVRw");
+          checks.push({
+            name: "youtube_api",
+            status: "ok",
+            detail: "YouTube API key is configured && passed a live metadata probe.",
+          });
+        } catch (error) {
+          checks.push({
+            name: "youtube_api",
+            status: "warn",
+            detail: toMessage(error),
+          });
+          suggestions.push("Verify YOUTUBE_API_KEY && confirm the YouTube Data API v3 is enabled for that project.");
+        }
+      } else {
+        checks.push({
+          name: "youtube_api",
+          status: "ok",
+          detail: "YOUTUBE_API_KEY configured. Live probe skipped.",
+        });
+      }
+    } else {
+      checks.push({
+        name: "youtube_api",
+        status: "skipped",
+        detail: "YOUTUBE_API_KEY not configured. Metadata fallbacks still work, but quotas && fidelity are lower.",
+      });
+      suggestions.push("Add YOUTUBE_API_KEY if you want stronger metadata diagnostics && less fallback reliance.");
+    }
+
+    if (geminiConfigured) {
+      if (runLiveChecks) {
+        try {
+          const provider = await createEmbeddingProvider(resolveEmbeddingSelection({ embeddingProvider: "gemini" }));
+          await provider?.embedQuery("youtube import health check");
+          checks.push({
+            name: "gemini_embeddings",
+            status: "ok",
+            detail: "Gemini embedding provider is configured && passed a live embedding probe.",
+          });
+        } catch (error) {
+          checks.push({
+            name: "gemini_embeddings",
+            status: "warn",
+            detail: toMessage(error),
+          });
+          suggestions.push("Verify GEMINI_API_KEY/GOOGLE_API_KEY if you want cloud embeddings.");
+        }
+      } else {
+        checks.push({
+          name: "gemini_embeddings",
+          status: "ok",
+          detail: "Gemini embedding key configured. Live probe skipped.",
+        });
+      }
+    } else {
+      checks.push({
+        name: "gemini_embeddings",
+        status: "skipped",
+        detail: "No Gemini key configured. Local embeddings remain available.",
+      });
+    }
+
+    try {
+      const probeFile = join(this.knowledgeBase.dataDir, `.health-${Date.now()}.tmp`);
+      writeFileSync(probeFile, "ok\n", "utf8");
+      unlinkSync(probeFile);
+      checks.push({
+        name: "storage",
+        status: "ok",
+        detail: `Knowledge-base directory is writable (${this.knowledgeBase.dataDir}).`,
+      });
+    } catch (error) {
+      checks.push({
+        name: "storage",
+        status: "error",
+        detail: toMessage(error),
+      });
+      suggestions.push("Ensure YOUTUBE_MCP_DATA_DIR points to a writable directory.");
+    }
+
+    const supportedClientDetected = clients.some((client) => client.supportLevel === "supported" && client.detected);
+    if (!supportedClientDetected) {
+      suggestions.push("No supported MCP client was detected automatically. Claude Desktop && Claude Code are the best-supported install targets tonight.");
+    }
+
+    const overallStatus = checks.some((check) => check.status === "error")
+      ? "degraded"
+      : checks.every((check) => check.status === "skipped")
+        ? "setup_needed"
+        : "ready";
+
+    return {
+      overallStatus,
+      dataDir: this.knowledgeBase.dataDir,
+      runtime: {
+        nodeVersion: process.version,
+        packageName: packageMeta.name,
+        packageVersion: packageMeta.version,
+      },
+      keys: {
+        youtubeApiConfigured,
+        geminiConfigured,
+      },
+      clients,
+      checks,
+      suggestions: dedupeStrings(suggestions),
+      provenance: this.makeProvenance("none", overallStatus !== "ready", checks.map((check) => `${check.name}: ${check.detail}`)),
+    };
+  }
+
+  async removeCollection(input: RemoveCollectionInput): Promise<RemoveCollectionOutput> {
+    if (!input.collectionId?.trim()) {
+      throw this.invalidInput("collectionId cannot be empty");
+    }
+    return this.knowledgeBase.removeCollection(input.collectionId.trim());
+  }
+
+  // ── Comment Knowledge Base ──
+
+  async importComments(input: ImportCommentsInput, options: ServiceOptions = {}): Promise<ImportCommentsOutput> {
+    const videoId = this.requireVideoId(input.videoIdOrUrl);
+    const collectionId = input.collectionId ?? CommentKnowledgeBase.videoCommentCollectionId(videoId);
+    const maxTopLevel = clamp(input.maxTopLevel ?? 100, 1, 200);
+    const includeReplies = input.includeReplies ?? true;
+    const maxRepliesPerThread = clamp(input.maxRepliesPerThread ?? 5, 0, 20);
+
+    // Fetch video metadata for title
+    let videoTitle = "Unknown video";
+    let channelTitle = "Unknown channel";
+    try {
+      const videoInfo = await this.inspectVideo({ videoIdOrUrl: videoId }, options);
+      videoTitle = videoInfo.video.title;
+      channelTitle = videoInfo.video.channelTitle;
+    } catch {
+      // Best-effort metadata
+    }
+
+    // Fetch comments
+    const commentsOutput = await this.readComments({
+      videoIdOrUrl: videoId,
+      maxTopLevel,
+      includeReplies,
+      maxRepliesPerThread,
+      order: input.order ?? "relevance",
+    }, options);
+
+    // Convert to CommentRecord[]
+    const comments: CommentRecord[] = commentsOutput.threads.map((thread) => ({
+      commentId: thread.commentId,
+      author: thread.author,
+      text: thread.text,
+      likeCount: thread.likeCount,
+      publishedAt: thread.publishedAt,
+      replies: thread.replies?.map((reply) => ({
+        commentId: reply.commentId,
+        author: reply.author,
+        text: reply.text,
+        likeCount: reply.likeCount,
+        publishedAt: reply.publishedAt,
+      })),
+    }));
+
+    const result = this.commentKnowledgeBase.importComments(
+      { collectionId, label: input.label },
+      [{ videoId, videoTitle, channelTitle, comments }],
+    );
+
+    const activeCollectionId = input.activateCollection === false
+      ? this.commentKnowledgeBase.getActiveCollectionId() ?? undefined
+      : this.commentKnowledgeBase.setActiveCollection(collectionId).activeCollectionId;
+
+    return {
+      ...result,
+      activeCollectionId,
+    };
+  }
+
+  async searchComments(input: SearchCommentsInput): Promise<SearchCommentsOutput> {
+    const query = input.query?.trim();
+    if (!query) {
+      throw this.invalidInput("Query cannot be empty");
+    }
+    return this.commentKnowledgeBase.search({ ...input, query });
+  }
+
+  async listCommentCollections(input: ListCommentCollectionsInput = {}): Promise<ListCommentCollectionsOutput> {
+    return this.commentKnowledgeBase.listCollections(input.includeVideoList ?? false);
+  }
+
+  async setActiveCommentCollection(input: SetActiveCommentCollectionInput): Promise<SetActiveCommentCollectionOutput> {
+    if (!input.collectionId?.trim()) {
+      throw this.invalidInput("collectionId cannot be empty");
+    }
+    return this.commentKnowledgeBase.setActiveCollection(input.collectionId.trim());
+  }
+
+  async clearActiveCommentCollection(): Promise<ClearActiveCommentCollectionOutput> {
+    return this.commentKnowledgeBase.clearActiveCollection();
+  }
+
+  async removeCommentCollection(input: RemoveCommentCollectionInput): Promise<RemoveCommentCollectionOutput> {
+    if (!input.collectionId?.trim()) {
+      throw this.invalidInput("collectionId cannot be empty");
+    }
+    return this.commentKnowledgeBase.removeCollection(input.collectionId.trim());
+  }
+
   async scoreHookPatterns(input: ScoreHookPatternsInput, options: ServiceOptions = {}): Promise<ScoreHookPatternsOutput> {
     if (!Array.isArray(input.videoIdsOrUrls) || input.videoIdsOrUrls.length === 0) {
       throw this.invalidInput("videoIdsOrUrls must contain at least one video");
@@ -867,6 +1601,384 @@ export class YouTubeService {
       },
       provenance: catalog.provenance,
     };
+  }
+
+  // ─── Trends & Discovery ────────────────────────────────────────────
+
+  async discoverNicheTrends(
+    input: DiscoverNicheTrendsInput,
+    options: ServiceOptions = {},
+  ): Promise<DiscoverNicheTrendsOutput> {
+    const niche = input.niche?.trim();
+    if (!niche) {
+      throw this.invalidInput("niche cannot be empty");
+    }
+
+    const maxResults = clamp(input.maxResults ?? 20, 5, 25);
+    const lookbackDays = clamp(input.lookbackDays ?? 90, 7, 365);
+
+    const limitations: string[] = [];
+
+    // Phase 1: search for recent videos in the niche (by date)
+    const recentSearch = await this.findVideos(
+      {
+        query: niche,
+        maxResults,
+        order: "date",
+        regionCode: input.regionCode,
+        publishedAfter: new Date(Date.now() - lookbackDays * 86_400_000).toISOString(),
+      },
+      options,
+    );
+
+    // Phase 2: search for top-performing videos (by viewCount)
+    const topSearch = await this.findVideos(
+      {
+        query: niche,
+        maxResults: Math.min(maxResults, 15),
+        order: "viewCount",
+        regionCode: input.regionCode,
+      },
+      options,
+    );
+
+    // Merge && deduplicate
+    const seen = new Set<string>();
+    const allResults = [...recentSearch.results, ...topSearch.results];
+    const deduped = allResults.filter((item) => {
+      if (seen.has(item.videoId)) return false;
+      seen.add(item.videoId);
+      return true;
+    });
+
+    // Enrich with inspect for tags && engagement when possible
+    const enriched: TrendingVideo[] = [];
+    const provenances: Provenance[] = [recentSearch.provenance, topSearch.provenance];
+
+    for (const item of deduped.slice(0, maxResults)) {
+      let video: InspectVideoOutput | undefined;
+      try {
+        video = await this.inspectVideo(
+          { videoIdOrUrl: item.videoId },
+          options,
+        );
+        provenances.push(video.provenance);
+      } catch {
+        // Fall back to search-only data
+      }
+
+      enriched.push({
+        videoId: item.videoId,
+        title: video?.video.title ?? item.title,
+        channelTitle: video?.video.channelTitle ?? item.channelTitle,
+        publishedAt: video?.video.publishedAt ?? item.publishedAt,
+        durationSec: video?.video.durationSec ?? item.durationSec,
+        views: video?.stats.views ?? item.views,
+        likes: video?.stats.likes,
+        comments: video?.stats.comments,
+        engagementRate: computeEngagementRate({
+          views: video?.stats.views ?? item.views,
+          likes: video?.stats.likes,
+          comments: video?.stats.comments,
+        }),
+        viewVelocity24h: computeViewVelocity24h(
+          video?.stats.views ?? item.views,
+          video?.video.publishedAt ?? item.publishedAt,
+        ),
+        format: inferVideoFormat(video?.video.durationSec ?? item.durationSec),
+        tags: video?.video.tags,
+      });
+    }
+
+    // Sort by views descending for presentation
+    enriched.sort((a, b) => (b.views ?? 0) - (a.views ?? 0));
+
+    // Compute trend signals
+    const momentum = computeNicheMomentum(enriched, lookbackDays);
+    const saturation = computeNicheSaturation(enriched);
+    const contentGaps = detectContentGaps(enriched, niche);
+    const formatBreakdown = computeFormatBreakdown(enriched);
+
+    // Keywords && title patterns from enriched results
+    const videoRecords = enriched.map((v) => ({
+      videoId: v.videoId,
+      title: v.title,
+      channelTitle: v.channelTitle,
+      tags: v.tags,
+      url: "",
+    } as VideoRecord));
+    const recurringKeywords = extractRecurringKeywords(videoRecords, 10);
+    const titlePatterns = topStrings(
+      enriched.map((v) => titleStructure(v.title)),
+      6,
+    );
+
+    // Honest limitations
+    limitations.push(
+      "Trend signals are derived from YouTube search results, not internal YouTube trending data (which is not publicly available via API).",
+    );
+    limitations.push(
+      `Momentum is estimated from ${enriched.length} sampled videos. Larger niches may need more sampling for precision.`,
+    );
+    if (!this.api.isConfigured()) {
+      limitations.push(
+        "Running without YOUTUBE_API_KEY — tag data && some engagement metrics may be missing from yt-dlp fallback.",
+      );
+    }
+    if (enriched.length < 10) {
+      limitations.push(
+        `Only ${enriched.length} videos found. This may be a very narrow niche or the search terms need refinement.`,
+      );
+    }
+
+    return {
+      niche,
+      regionCode: input.regionCode,
+      trendingVideos: enriched.slice(0, maxResults),
+      momentum,
+      saturation,
+      contentGaps,
+      recurringKeywords,
+      titlePatterns,
+      formatBreakdown,
+      limitations,
+      provenance: this.mergeProvenances(provenances),
+    };
+  }
+
+  async exploreNicheCompetitors(
+    input: ExploreNicheCompetitorsInput,
+    options: ServiceOptions = {},
+  ): Promise<ExploreNicheCompetitorsOutput> {
+    const niche = input.niche?.trim();
+    if (!niche) {
+      throw this.invalidInput("niche cannot be empty");
+    }
+
+    const maxChannels = clamp(input.maxChannels ?? 10, 3, 20);
+    const limitations: string[] = [];
+
+    // Search for top videos in the niche to discover active channels
+    const search = await this.findVideos(
+      {
+        query: niche,
+        maxResults: 25,
+        order: "relevance",
+        regionCode: input.regionCode,
+      },
+      options,
+    );
+
+    // Group by channel
+    const channelMap = new Map<
+      string,
+      {
+        channelTitle: string;
+        channelId?: string;
+        videos: Array<{ videoId: string; title: string; views?: number; engagementRate?: number }>;
+      }
+    >();
+
+    for (const result of search.results) {
+      const key = result.channelTitle;
+      const current = channelMap.get(key) ?? {
+        channelTitle: result.channelTitle,
+        channelId: result.channelId,
+        videos: [],
+      };
+      current.videos.push({
+        videoId: result.videoId,
+        title: result.title,
+        views: result.views,
+        engagementRate: result.engagementRate,
+      });
+      channelMap.set(key, current);
+    }
+
+    // Build competitor profiles
+    const competitors: NicheCompetitor[] = [];
+    const channelEntries = Array.from(channelMap.values())
+      .sort((a, b) => {
+        const aMax = Math.max(...a.videos.map((v) => v.views ?? 0));
+        const bMax = Math.max(...b.videos.map((v) => v.views ?? 0));
+        return bMax - aMax;
+      })
+      .slice(0, maxChannels);
+
+    for (const entry of channelEntries) {
+      const views = entry.videos.map((v) => v.views ?? 0).filter((v) => v > 0);
+      const engagements = entry.videos.map((v) => v.engagementRate ?? 0).filter((v) => v > 0);
+      const topVideo = [...entry.videos].sort((a, b) => (b.views ?? 0) - (a.views ?? 0))[0];
+
+      let uploadFrequency: string | undefined;
+      // Best-effort cadence estimate from search results is very rough
+      if (entry.videos.length >= 2) {
+        uploadFrequency = `${entry.videos.length} videos in search results (rough proxy)`;
+      }
+
+      competitors.push({
+        channelId: entry.channelId,
+        channelTitle: entry.channelTitle,
+        videosSampled: entry.videos.length,
+        medianViews: median(views),
+        medianEngagementRate: median(engagements),
+        estimatedUploadFrequency: uploadFrequency,
+        topVideo: topVideo
+          ? {
+              videoId: topVideo.videoId,
+              title: topVideo.title,
+              views: topVideo.views,
+            }
+          : undefined,
+      });
+    }
+
+    const allMedianViews = competitors
+      .map((c) => c.medianViews ?? 0)
+      .filter((v) => v > 0);
+    const topPerformer = competitors[0];
+
+    limitations.push(
+      "Competitor discovery is based on YouTube search results for the niche query, not a comprehensive channel database.",
+    );
+    limitations.push(
+      "Channels that rank for this niche but have diverse content may appear — verify niche relevance manually.",
+    );
+    if (search.results.length < 10) {
+      limitations.push(
+        `Only ${search.results.length} search results returned. The competitor landscape may be incomplete.`,
+      );
+    }
+
+    return {
+      niche,
+      competitors,
+      landscape: {
+        totalChannelsSampled: competitors.length,
+        medianViewsAcrossChannels: median(allMedianViews),
+        topPerformerChannelTitle: topPerformer?.channelTitle,
+      },
+      limitations,
+      provenance: search.provenance,
+    };
+  }
+
+  private async prepareKnowledgeBaseItems(
+    videoIdsOrUrls: string[],
+    config: {
+      language?: string;
+      chunkStrategy?: PlaylistKnowledgeBaseInput["chunkStrategy"];
+      chunkSizeSec?: number;
+      chunkOverlapSec?: number;
+      reindexExisting?: boolean;
+    },
+    collectionId: string,
+    options: ServiceOptions,
+  ): Promise<{
+    items: Array<{ video: VideoRecord; transcript: TranscriptRecord; options: { strategy: "auto" | "chapters" | "time_window"; chunkSizeSec: number; chunkOverlapSec: number } }>;
+    skipped: number;
+    failures: Array<{ videoId: string; reason: string }>;
+    totalRequested: number;
+  }> {
+    const items: Array<{ video: VideoRecord; transcript: TranscriptRecord; options: { strategy: "auto" | "chapters" | "time_window"; chunkSizeSec: number; chunkOverlapSec: number } }> = [];
+    const seen = new Set<string>();
+    const failures: Array<{ videoId: string; reason: string }> = [];
+    let skipped = 0;
+
+    for (const raw of videoIdsOrUrls) {
+      let videoId: string;
+      try {
+        videoId = this.requireVideoId(raw);
+      } catch (error) {
+        failures.push({
+          videoId: raw,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
+      if (seen.has(videoId)) {
+        skipped += 1;
+        continue;
+      }
+      seen.add(videoId);
+
+      if (!config.reindexExisting && this.knowledgeBase.hasVideo(collectionId, videoId)) {
+        skipped += 1;
+        continue;
+      }
+
+      try {
+        const [video, transcript] = await Promise.all([
+          this.fetchVideoInfoForIndexing(videoId, options),
+          this.fetchTranscriptForIndexing(videoId, config.language, options),
+        ]);
+
+        items.push({
+          video,
+          transcript,
+          options: {
+            strategy: (config.chunkStrategy ?? "auto") as "auto" | "chapters" | "time_window",
+            chunkSizeSec: clamp(config.chunkSizeSec ?? 120, 30, 900),
+            chunkOverlapSec: clamp(config.chunkOverlapSec ?? 30, 0, 300),
+          },
+        });
+      } catch (error) {
+        failures.push({
+          videoId,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return {
+      items,
+      skipped,
+      failures,
+      totalRequested: videoIdsOrUrls.length,
+    };
+  }
+
+  private async fetchVideoInfoForIndexing(videoId: string, options: ServiceOptions): Promise<VideoRecord> {
+    const resolved = await this.executeFallback(
+      {
+        youtube_api: () => this.api.getVideoInfo(videoId),
+        yt_dlp: () => this.ytdlp.videoInfo(videoId),
+        page_extract: () => this.pageExtract.getVideoInfo(videoId),
+      },
+      this.sampleVideo(videoId),
+      options,
+      { partialTiers: ["page_extract"] },
+    );
+    return resolved.data;
+  }
+
+  private async fetchTranscriptForIndexing(videoId: string, language: string | undefined, options: ServiceOptions): Promise<TranscriptRecord> {
+    const resolved = await this.executeFallback(
+      {
+        yt_dlp: () => this.ytdlp.transcript(videoId, language),
+      },
+      this.sampleTranscript(videoId),
+      options,
+      { partialTiers: [] },
+    );
+    return resolved.data;
+  }
+
+  private defaultVideoCollectionId(input: VideoKnowledgeBaseInput): string {
+    if (input.collectionId) {
+      return input.collectionId;
+    }
+    const fingerprint = input.videoIdsOrUrls
+      .slice(0, 50)
+      .map((item) => this.requireVideoId(item))
+      .join("-")
+      .slice(0, 48);
+    const base = (input.label ?? "videos")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "videos";
+    return `${base}-${fingerprint}`;
   }
 
   private async analyzeSingleVideo(
@@ -1319,12 +2431,12 @@ export class YouTubeService {
       sourceType: "manual_caption",
       confidence: 0.93,
       transcriptText:
-        "Today I'm going to show you how to research YouTube titles that actually earn clicks without resorting to clickbait. We'll look at patterns, compare examples, and leave with a checklist you can reuse.",
+        "Today I'm going to show you how to research YouTube titles that actually earn clicks without resorting to clickbait. We'll look at patterns, compare examples, && leave with a checklist you can reuse.",
       segments: [
         { tStartSec: 0, tEndSec: 9, text: "Today I'm going to show you how to research YouTube titles that actually earn clicks without resorting to clickbait." },
-        { tStartSec: 9, tEndSec: 18, text: "We'll look at patterns, compare examples, and leave with a checklist you can reuse." },
+        { tStartSec: 9, tEndSec: 18, text: "We'll look at patterns, compare examples, && leave with a checklist you can reuse." },
         { tStartSec: 18, tEndSec: 34, text: "First, start by mapping titles that use a clear promise, proof point, or surprising contrast." },
-        { tStartSec: 34, tEndSec: 52, text: "Then compare the opening hook and audience comments to see whether the title matched the payoff." },
+        { tStartSec: 34, tEndSec: 52, text: "Then compare the opening hook && audience comments to see whether the title matched the payoff." },
       ],
       chapters: [
         { title: "Intro", tStartSec: 0, tEndSec: 18 },
@@ -1338,7 +2450,7 @@ export class YouTubeService {
       {
         commentId: "comment-1",
         author: "Builder One",
-        text: "Great breakdown. Super clear and helpful.",
+        text: "Great breakdown. Super clear && helpful.",
         likeCount: 12,
         publishedAt: "2026-03-01T10:00:00.000Z",
       },
@@ -1372,6 +2484,62 @@ export class YouTubeService {
       channelTitle: "youtube-mcp",
       videoCountReported: 3,
       videos: this.sampleChannelVideos("UC_x5XG1OV2P6uZZ5FSM9Ttw"),
+    };
+  }
+
+  private sampleImportReadiness(videoId: string): CheckImportReadinessOutput {
+    const transcript = this.sampleTranscript(videoId);
+    return {
+      videoId,
+      title: this.sampleVideo(videoId).title,
+      importReadiness: {
+        canImport: true,
+        status: "ready",
+        summary: "Dry-run transcript is importable && should chunk normally for semantic search.",
+        suggestedCollectionId: TranscriptKnowledgeBase.videosCollectionId({ videoIdsOrUrls: [videoId] }),
+      },
+      transcript: {
+        available: true,
+        sourceType: transcript.sourceType,
+        languageUsed: transcript.languageUsed,
+        segmentCount: transcript.segments.length,
+        transcriptCharacters: transcript.transcriptText.length,
+        sparseTranscript: false,
+        estimatedSearchableChunks: estimateTranscriptChunks(transcript),
+      },
+      checks: [
+        { name: "youtube_api_metadata", status: "skipped", detail: "Dry-run mode enabled." },
+        { name: "yt_dlp_binary", status: "ok", detail: "Dry-run assumes yt-dlp is available." },
+        { name: "yt_dlp_transcript", status: "ok", detail: "Dry-run transcript probe succeeded." },
+      ],
+      suggestions: [],
+      provenance: this.makeProvenance("none", false, ["Dry-run mode enabled. No external calls were made."]),
+    };
+  }
+
+  private sampleSystemHealth(): CheckSystemHealthOutput {
+    const packageMeta = readPackageMetadata();
+    return {
+      overallStatus: "ready",
+      dataDir: this.knowledgeBase.dataDir,
+      runtime: {
+        nodeVersion: process.version,
+        packageName: packageMeta.name,
+        packageVersion: packageMeta.version,
+      },
+      keys: {
+        youtubeApiConfigured: Boolean(process.env.YOUTUBE_API_KEY),
+        geminiConfigured: Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY),
+      },
+      clients: detectKnownClients(),
+      checks: [
+        { name: "yt_dlp", status: "ok", detail: "Dry-run assumes yt-dlp is available." },
+        { name: "youtube_api", status: "skipped", detail: "Dry-run skipped live API validation." },
+        { name: "gemini_embeddings", status: "skipped", detail: "Dry-run skipped live Gemini validation." },
+        { name: "storage", status: "ok", detail: `Dry-run data directory available (${this.knowledgeBase.dataDir}).` },
+      ],
+      suggestions: [],
+      provenance: this.makeProvenance("none", false, ["Dry-run mode enabled. No external calls were made."]),
     };
   }
 }
@@ -1413,4 +2581,27 @@ function topStrings(values: string[], limit: number): string[] {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .slice(0, limit)
     .map(([value]) => value);
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return values.filter((value, index) => value && values.indexOf(value) === index);
+}
+
+function isSparseTranscript(transcript: TranscriptRecord): boolean {
+  const text = transcript.transcriptText.replace(/\s+/g, " ").trim();
+  const tokenCount = text.split(/\s+/).filter(Boolean).length;
+  return text.length < 200 || tokenCount < 40 || transcript.segments.length <= 2;
+}
+
+function estimateTranscriptChunks(transcript: TranscriptRecord): number {
+  if (transcript.segments.length === 0) {
+    return 0;
+  }
+  if (isSparseTranscript(transcript)) {
+    return 1;
+  }
+  const firstStart = transcript.segments[0]?.tStartSec ?? 0;
+  const lastEnd = transcript.segments[transcript.segments.length - 1]?.tEndSec ?? firstStart;
+  const duration = Math.max(1, lastEnd - firstStart);
+  return Math.max(1, Math.ceil(duration / 120));
 }
