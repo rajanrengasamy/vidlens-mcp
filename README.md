@@ -270,82 +270,17 @@ Checks: Node.js version, yt-dlp availability, API key validation, data directory
 
 ### System Overview
 
-```mermaid
-graph TB
-    subgraph Client["MCP Client"]
-        Claude["Claude Desktop"]
-        Cursor["Cursor"]
-        VSCode["VS Code"]
-        Other["Any MCP Client"]
-    end
-
-    subgraph VidLens["VidLens MCP Server"]
-        Router["Tool Router"]
-        
-        subgraph Modules["9 Tool Modules · 40 Tools"]
-            Core["📺 Core<br/>7 tools"]
-            KB["🔎 Knowledge Base<br/>7 tools"]
-            Sentiment["💬 Sentiment<br/>4 tools"]
-            Creator["🎯 Creator Intel<br/>4 tools"]
-            Trends["📈 Discovery<br/>2 tools"]
-            Media["🎬 Media<br/>5 tools"]
-            Visual["🖼️ Visual Search<br/>3 tools"]
-            Comments["💭 Comments<br/>6 tools"]
-            Diag["🏥 Diagnostics<br/>2 tools"]
-        end
-
-        subgraph Storage["Local Storage"]
-            SQLite["SQLite + sqlite-vec"]
-            Embeddings["Embedding Index<br/>384d / 768d vectors"]
-            MediaStore["Media Store<br/>video · audio · frames"]
-        end
-
-        subgraph Fallback["Three-Tier Fallback Chain"]
-            T1["① YouTube Data API v3"]
-            T2["② yt-dlp"]
-            T3["③ Page extraction"]
-        end
-    end
-
-    subgraph External["External Services"]
-        YT["YouTube"]
-        Gemini["Gemini API"]
-        AppleVision["Apple Vision"]
-    end
-
-    Client -->|stdio / SSE| Router
-    Router --> Modules
-    Modules --> Fallback
-    Fallback --> YT
-    KB --> SQLite
-    KB --> Embeddings
-    Visual --> Embeddings
-    Visual --> MediaStore
-    Visual --> AppleVision
-    Visual --> Gemini
-    Comments --> SQLite
-    Media --> MediaStore
-
-    T1 -.->|"quota exceeded?"| T2
-    T2 -.->|"unavailable?"| T3
-```
+<p align="center">
+  <img src="assets/arch-system-overview.png" alt="VidLens System Overview" width="800" />
+</p>
 
 ### How the Fallback Chain Works
 
 Every tool that touches YouTube data uses the same resilience pattern:
 
-```mermaid
-flowchart LR
-    Request["Tool call"] --> Check{"API key<br/>configured?"}
-    Check -->|Yes| API["YouTube API v3"]
-    Check -->|No| YTD["yt-dlp"]
-    API -->|"200 ✓"| OK["Return data +<br/>provenance tag"]
-    API -->|"403 / quota"| YTD
-    YTD -->|"✓"| OK
-    YTD -->|"error"| Page["Page Extraction"]
-    Page -->|"✓"| OK
-    Page -->|"error"| Fail["Graceful error +<br/>fallback report"]
-```
+<p align="center">
+  <img src="assets/arch-fallback-chain.png" alt="VidLens Fallback Chain" width="800" />
+</p>
 
 Every response includes a `provenance` field telling you exactly which tier served the data and whether anything was partial. No silent degradation — you always know what happened.
 
@@ -353,26 +288,9 @@ Every response includes a `provenance` field telling you exactly which tier serv
 
 Visual search is not transcript reuse. It's a dedicated three-layer index:
 
-```mermaid
-flowchart TB
-    Video["Video URL"] --> Extract["Extract Keyframes<br/>ffmpeg scene detection"]
-    
-    Extract --> L1["Layer 1: Apple Vision<br/>Feature prints + OCR"]
-    Extract --> L2["Layer 2: Gemini Vision<br/>Frame descriptions"]
-    
-    L1 --> FP["Feature Print Index"]
-    L1 --> OCR["OCR Text"]
-    L2 --> Desc["Scene Descriptions"]
-    
-    OCR --> L3["Layer 3: Gemini Embeddings<br/>768-dim semantic vectors"]
-    Desc --> L3
-    
-    L3 --> VecDB["sqlite-vec Index"]
-    FP --> VecDB
-    
-    VecDB --> Search["searchVisualContent / findSimilarFrames"]
-    Search --> Results["Frame path · Timestamp · Source video<br/>Match reason · OCR text · Visual description"]
-```
+<p align="center">
+  <img src="assets/arch-visual-pipeline.png" alt="VidLens Visual Search Pipeline" width="800" />
+</p>
 
 **Three layers, all real:**
 1. **Apple Vision feature prints** — image-to-image similarity (find frames that *look* alike)
@@ -383,18 +301,9 @@ flowchart TB
 
 Everything lives in a single directory. No external databases, no Docker, no infrastructure.
 
-```
-~/.vidlens/
-├── vidlens.db            # Metadata, embeddings, indexes (sqlite-vec)
-├── media/
-│   └── {video-id}/
-│       ├── video.mp4
-│       ├── audio.mp3
-│       └── frames/
-│           ├── frame_001_00m30s.jpg
-│           └── frame_002_01m15s.jpg
-└── logs/                 # Diagnostics output
-```
+<p align="center">
+  <img src="assets/arch-data-storage.png" alt="VidLens Data Storage" width="600" />
+</p>
 
 One directory. Portable. Back it up by copying. Delete it to start fresh.
 
